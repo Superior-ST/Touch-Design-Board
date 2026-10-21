@@ -141,6 +141,54 @@ export class OnlineEvaluationPage {
     });
   }
 
+  /**
+   * Pick the judge model from a NAMED provider group, and stop there.
+   *
+   * `selectJudgeModel` takes the first option matching the display name, which
+   * is ambiguous for a built-in OpenRouter id: the picker renders the id itself
+   * as the display name, and a Custom provider called `openrouter` — which
+   * `ensureModelAvailable` and the `@provider-sanity` matrix both create —
+   * offers models under the same labels. Taking `.first()` would then read the
+   * custom provider's panel and call it OpenRouter's.
+   *
+   * While the search box holds text the picker renders a flat list grouped by
+   * provider, each group labelled, which is what makes the scope available.
+   */
+  async selectJudgeModelFromProvider(
+    providerGroup: string,
+    modelDisplayName: string,
+  ): Promise<void> {
+    return test.step(
+      `select judge model "${modelDisplayName}" from the ${providerGroup} group`,
+      async () => {
+        assertAllowedModelDisplayName(modelDisplayName);
+        const modelCombobox = this.judgeModelCombobox;
+        const listbox = this.page.getByRole('listbox');
+        await expect(async () => {
+          await modelCombobox.click();
+          await expect(listbox).toBeVisible({ timeout: 2_000 });
+        }).toPass({ timeout: 15_000 });
+
+        // Re-filtered and re-clicked for the same reason as selectJudgeModel:
+        // the option list remounts when /llm/models resolves, detaching
+        // options mid-click.
+        await expect(async () => {
+          await listbox.getByPlaceholder('Search model').fill(modelDisplayName);
+          // By the group's accessible NAME, which Radix takes from its
+          // `SelectLabel`. Exact and asserted to be unique, so a provider
+          // label that stopped being unique fails here rather than selecting
+          // from whichever group matched first.
+          const group = listbox.getByRole('group', { name: providerGroup, exact: true });
+          await expect(group, `the ${providerGroup} provider group`).toHaveCount(1);
+          const option = group.getByRole('option', { name: modelDisplayName, exact: true });
+          await expect(option, `"${modelDisplayName}" under ${providerGroup}`).toHaveCount(1);
+          await option.click({ timeout: 2_000 });
+          await expect(modelCombobox).toContainText(modelDisplayName, { timeout: 2_000 });
+        }).toPass({ timeout: 30_000 });
+      },
+    );
+  }
+
   /** The dialog's LLM-model combobox. */
   private get judgeModelCombobox(): Locator {
     return this.dialog
@@ -202,6 +250,149 @@ export class OnlineEvaluationPage {
   }
 
   /**
+   * The Thinking effort dropdown in the OPEN judge parameters panel.
+   *
+   * By its accessible name, not a testid: `AnthropicModelConfigs` renders a
+   * `<Label htmlFor="thinkingEffort">` beside a `SelectBox id="thinkingEffort"`,
+   * so the label is the one handle on the control that is not a utility class.
+   * `PlaygroundPage.thinkingEffortTrigger` addresses the same component, though
+   * by role rather than by label.
+   *
+   * Not covered by `mountedJudgeParameterIds`, which reads `SliderInputControl`
+   * number inputs — this is a Radix select and has none, so a spec asserting on
+   * the effort has to come through here.
+   *
+   * Its ABSENCE is as much the assertion as its text. The control renders only
+   * while the chosen model declares effort levels, so a model whose
+   * capabilities row lists none drops it from the panel entirely rather than
+   * showing it empty — and a rule switched onto such a model should have no
+   * stored effort left either.
+   */
+  get judgeThinkingEffortSelect(): Locator {
+    return this.judgeModelParametersPanel.getByLabel('Thinking effort');
+  }
+
+  /**
+   * Close the judge parameters panel with ONE Escape, then wait for it to go.
+   *
+   * Exactly one press, deliberately — the opposite of
+   * `PlaygroundPage.closeModelParameters`, which presses until the panel goes.
+   * Here the panel sits inside the rule dialog: its close is animated, so it
+   * still reports visible for a beat, and a second press lands on the DIALOG
+   * and dismisses the whole form (which presents as Cancel detaching
+   * mid-click). One press and a wait is enough because every caller has just
+   * clicked an interactive child, so focus is already inside the panel.
+   *
+   * Needed by any spec that reads the panel and then goes back to the form —
+   * changing the model, naming the rule, saving. A spec that only reads the
+   * panel and stops should open a fresh dialog instead.
+   */
+  async closeJudgeModelParameters(): Promise<void> {
+    return test.step('close the judge model parameters', async () => {
+      await this.page.keyboard.press('Escape');
+      await this.judgeModelParametersPanel.waitFor({ state: 'hidden' });
+    });
+  }
+
+  /**
+   * A named control's label inside the open judge parameters panel.
+   *
+   * Exact, and the assertion in its own right for the effort control: the
+   * panel renders "Effort" rather than "Thinking effort" for a Claude model
+   * declaring `effortWithoutThinking`, where the level changes answer length
+   * and tool use without turning thinking on. "Thinking level" is the Gemini
+   * spelling of the same slot.
+   */
+  judgeParameterLabel(label: string): Locator {
+    return this.judgeModelParametersPanel.getByText(label, { exact: true });
+  }
+
+  /**
+   * The note that replaces the temperature while Claude can think.
+   *
+   * The WORDING is load-bearing, which is why this returns the element rather
+   * than a boolean. A rule cannot store a Top P — `RULE_UNSUPPORTED_PARAMS`
+   * strips it — so this surface must render the temperature-only sentence and
+   * not the playground's two-parameter one, which would tell the user to go
+   * and set a Top P control that is not there.
+   */
+  get judgeSamplingOffNote(): Locator {
+    return this.judgeModelParametersPanel.getByText(/(?:are|is) off while Claude can think/);
+  }
+
+  /**
+   * The effort / thinking-level `Select` the open judge parameters panel mounts.
+   *
+   * Addressed by role, not by its label: `SelectBox` does put the id on the
+   * trigger, but the label is itself under test and differs per provider
+   * ("Thinking effort", "Effort", "Thinking level"). The panel's only other
+   * controls are `SliderInputControl` number inputs, so its one combobox is
+   * this dropdown — asserted `toHaveCount(1)` before every read rather than
+   * taken as `.first()`.
+   */
+  get judgeEffortTrigger(): Locator {
+    return this.judgeModelParametersPanel.getByRole('combobox');
+  }
+
+  /** The level the judge parameters panel currently DISPLAYS. */
+  async readJudgeEffort(): Promise<string> {
+    return test.step('read the displayed judge effort', async () => {
+      await expect(
+        this.judgeEffortTrigger,
+        'the judge parameters panel mounts exactly one effort control',
+      ).toHaveCount(1);
+      return ((await this.judgeEffortTrigger.textContent()) ?? '').trim();
+    });
+  }
+
+  /**
+   * Every level the judge effort control OFFERS, in the order it lists them.
+   *
+   * The whole list rather than one membership check: "Off is gone" and "the
+   * levels are gone" are different regressions, and for Gemini the absence of
+   * Off is the model's own constraint — Google answers a zero budget with
+   * "Budget 0 is invalid. This model only works in thinking mode."
+   */
+  async judgeEffortOptions(): Promise<string[]> {
+    return test.step('read the offered judge effort levels', async () => {
+      const listbox = await this.openJudgeEffortListbox();
+      const options = await listbox.getByRole('option').allTextContents();
+      await this.page.keyboard.press('Escape');
+      await expect(listbox).toBeHidden();
+      return options.map((o) => o.trim());
+    });
+  }
+
+  /** Pick a judge effort / thinking level by its rendered label, e.g. `Low`. */
+  async selectJudgeEffort(label: string): Promise<void> {
+    return test.step(`select judge effort "${label}"`, async () => {
+      const listbox = await this.openJudgeEffortListbox();
+      const option = listbox.getByRole('option', { name: label, exact: true });
+      // Exactly one, not `.first()`: "High" and "xHigh" are both offered on
+      // some models, and an ambiguous match would store the wrong level.
+      await expect(option, `"${label}" is offered`).toHaveCount(1);
+      await option.click();
+      await expect(listbox).toBeHidden();
+      await expect(this.judgeEffortTrigger).toHaveText(label);
+    });
+  }
+
+  private async openJudgeEffortListbox(): Promise<Locator> {
+    await expect(
+      this.judgeEffortTrigger,
+      'the judge parameters panel mounts exactly one effort control',
+    ).toHaveCount(1);
+    const listbox = this.page.getByRole('listbox');
+    // Retried: the panel remounts when the model and provider-key queries
+    // resolve, which detaches the trigger mid-click.
+    await expect(async () => {
+      await this.judgeEffortTrigger.click();
+      await expect(listbox).toBeVisible({ timeout: 2_000 });
+    }).toPass({ timeout: 15_000 });
+    return listbox;
+  }
+
+  /**
    * Delete a rule through the row's kebab menu, confirming the destructive
    * dialog. Resolves once the row is gone from the list.
    *
@@ -260,6 +451,56 @@ export class OnlineEvaluationPage {
    */
   get samplingRateInput(): Locator {
     return this.dialog.getByTestId('sampling_rate-input');
+  }
+
+  /**
+   * The sampling-rate control's reset arrow — `SliderInputControl`'s
+   * "restore the default" button, the one the rest of this dialog's rows also
+   * carry.
+   *
+   * Addressed as the `<button>` sibling of the input rather than by test id or
+   * accessible name because it has NEITHER: the component renders a bare
+   * `Button` wrapping a `RotateCcw` icon with no `aria-label`, and there are
+   * three other nameless buttons in this dialog, so nothing else in the subtree
+   * tells them apart. A `data-testid` on `SliderInputControl` is the right fix
+   * and belongs in the frontend; this spec cannot ship one, because the QA
+   * branch is only allowed to touch `tests_end_to_end/`.
+   *
+   * Anchored on the input's OWN test id rather than on a position, so it is not
+   * the `nth-child` kind of structural selector: it moves with the control, and
+   * it resolves to nothing — loudly — if the button ever stops being the
+   * input's sibling, instead of silently addressing a different button.
+   */
+  get samplingRateResetButton(): Locator {
+    return this.dialog.locator(
+      'xpath=.//input[@data-testid="sampling_rate-input"]/preceding-sibling::button',
+    );
+  }
+
+  /**
+   * The row holding the "Sampling rate" label, its reset arrow and its value
+   * box — the box whose height is the subject of the steady-row assertion.
+   */
+  get samplingRateControlRow(): Locator {
+    return this.dialog.locator(
+      'xpath=.//input[@data-testid="sampling_rate-input"]' +
+        '/ancestor::div[contains(@class,"justify-between")][1]',
+    );
+  }
+
+  /**
+   * Click the sampling-rate reset arrow and resolve once the input shows the
+   * default again.
+   *
+   * Deliberately asserts nothing about the dialog: whether the dialog is still
+   * open afterwards is the behaviour under test, and a POM that waited for it
+   * would absorb the failure it exists to expose.
+   */
+  async resetSamplingRate(): Promise<void> {
+    return test.step('click the sampling-rate reset arrow', async () => {
+      await this.samplingRateResetButton.click();
+      await expect(this.samplingRateInput).toHaveValue('100');
+    });
   }
 
   /**
@@ -710,6 +951,24 @@ export class OnlineEvaluationPage {
   async fillAndSubmitCreateRuleDialogLLMJudge(
     fields: CreateRuleDialogLLMJudgeFields,
   ): Promise<void> {
+    await this.fillCreateRuleDialogLLMJudge(fields);
+    await this.submitRuleDialog();
+  }
+
+  /**
+   * The same fill, stopping short of the submit.
+   *
+   * For a spec that has to touch the form between filling it and saving —
+   * setting a model parameter through the gear, say. The order matters and is
+   * why this is one method rather than a caller's own sequence: picking the
+   * template rebuilds the prompt and variable-mapping section, so it has to
+   * come before anything else, and the model has to be chosen before its
+   * parameters panel exists at all. A caller adjusting model parameters does it
+   * AFTER this returns.
+   */
+  async fillCreateRuleDialogLLMJudge(
+    fields: CreateRuleDialogLLMJudgeFields,
+  ): Promise<void> {
     const d = this.dialog;
     await d.getByRole('textbox', { name: 'Rule name' }).fill(fields.name);
 
@@ -749,9 +1008,6 @@ export class OnlineEvaluationPage {
     // OnlineScoringEngine.toVariableMapping — dot-containing paths get
     // `$.output`, bare paths get `$` which yields the whole JSON node).
     await this.setVariableMapping('output', 'output.output');
-
-    await d.getByTestId('add-edit-rule-dialog-submit').click();
-    await d.waitFor({ state: 'hidden' });
   }
 
   /**

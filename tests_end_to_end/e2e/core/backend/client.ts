@@ -125,8 +125,58 @@ export interface RawApiResult {
   location?: string | null;
 }
 
+/**
+ * One model's curated row as `GET /v1/private/llm/models` serves it, reduced to
+ * the `effort` parameter.
+ *
+ * This endpoint is the *catalog* — the same `llm-models-curated.yaml` data the
+ * backend's own parameter gate reads through `registryService.curatedParamsOf`
+ * since opik#8928 replaced the hardcoded `EFFORT_LEVELS_BY_MODEL_ID` map with
+ * it. That is what makes it usable as an oracle rather than a second opinion:
+ * a spec comparing the playground's effort control against this is comparing
+ * the frontend's still-hardcoded `ANTHROPIC_MODEL_CAPABILITIES` against the
+ * data the backend will actually enforce.
+ *
+ * `accepted: false` and `levels: []` are deliberately NOT collapsed into one
+ * another. A row that refuses the parameter outright is a different fact from a
+ * row that accepts it with no levels curated yet, and the gate answers them
+ * with two different 400 messages — so a reader must be able to tell them
+ * apart. `levels` is therefore only meaningful when `accepted` is true, and a
+ * caller that needs it must assert `accepted` first.
+ */
+export interface LlmCatalogEffortRef {
+  /** Whether the row admits `custom_parameters.output_config.effort` at all. */
+  accepted: boolean;
+  /** The curated levels, in catalog order. Empty when `accepted` is false. */
+  levels: string[];
+  /** The level the row declares as its default, absent when it curates none. */
+  default: string | null;
+}
+
+/** One model of one provider in the curated catalog. */
+export interface LlmCatalogModelRef {
+  /** The provider model id — what a request's `model` field must name. */
+  id: string;
+  /**
+   * The display label, when the row carries one. Nullable because only some
+   * rows do: the eight dated/alias ids answer with no `label` at all, and a
+   * caller matching the UI's model picker has to know that rather than compare
+   * against the string `"undefined"`.
+   */
+  label: string | null;
+  effort: LlmCatalogEffortRef;
+}
+
 /** One row of the dataset's Version history tab. */
 export interface DatasetVersionRef {
+  /**
+   * The version's own row id — what the Version history table stamps as
+   * `data-row-id`, and what `POST /datasets/{id}/items/changes` wants as its
+   * `base_version`. Distinct from `versionHash`, which is the content hash the
+   * sidebar and the items endpoint address a version by; passing one where the
+   * other is wanted is accepted-looking and wrong.
+   */
+  id: string;
   versionName: string;
   /**
    * The version's content hash. Nullable because the API's own shape makes it
@@ -139,6 +189,80 @@ export interface DatasetVersionRef {
   itemsModified: number;
   itemsDeleted: number;
   isLatest: boolean;
+}
+
+/**
+ * A version's execution policy, as the suite surfaces render it: the sheet's
+ * meta block and the per-item Execution policy cell both format it as
+ * "<passThreshold> of <runsPerItem> must pass".
+ */
+export interface ExecutionPolicyRef {
+  passThreshold: number;
+  runsPerItem: number;
+}
+
+/**
+ * One version as `GET /v1/private/datasets/{id}/versions/hash/{hash}` answers
+ * it — the read the version-records sidebar makes when a row is opened.
+ *
+ * A superset of `DatasetVersionRef`, which is the shape the *list* endpoint
+ * answers and is mapped for the Version history tab's columns. This read is
+ * kept separate rather than folded into that mapper because what the sidebar
+ * needs from it is the suite half — `assertionNames` and `executionPolicy` —
+ * which the version table has no column for, and because the two are different
+ * endpoints that are allowed to disagree.
+ *
+ * `versionHash` is not nullable here: the caller addressed the version BY its
+ * hash, so a response that came back without one is a response about something
+ * else. `executionPolicy` is `null` only where the version genuinely carries
+ * none (a plain dataset), never defaulted — the sheet renders an em dash there,
+ * and a `{0, 0}` stand-in would read as a real policy.
+ */
+export interface DatasetVersionDetailRef {
+  id: string;
+  versionName: string;
+  versionHash: string;
+  itemsTotal: number;
+  itemsAdded: number;
+  itemsModified: number;
+  itemsDeleted: number;
+  isLatest: boolean;
+  /**
+   * The suite-level assertion names, derived the same way the FE's
+   * `extractAssertions` does — the `schema[].name` list of the FIRST evaluator,
+   * and only when that evaluator is an `llm_judge`. Mirroring the FE's rule
+   * rather than flattening every evaluator is deliberate: what the sheet's
+   * "Suite assertions" block shows is what this returns, so a spec asserting
+   * the two agree has to compute it the same way.
+   */
+  assertionNames: string[];
+  executionPolicy: ExecutionPolicyRef | null;
+}
+
+/**
+ * One item as of a particular version — the rows the version sidebar's table
+ * renders.
+ *
+ * `assertionNames` and `executionPolicy` are the per-item suite overrides, and
+ * `executionPolicy: null` is the load-bearing case rather than a gap: the
+ * sidebar renders an item with no policy of its own in grey, showing the
+ * SUITE's policy instead, so a spec asserting which rows inherit needs the
+ * absence itself.
+ */
+export interface VersionedDatasetItemRef {
+  id: string;
+  data: Record<string, unknown>;
+  assertionNames: string[];
+  executionPolicy: ExecutionPolicyRef | null;
+}
+
+/** One page of `GET /v1/private/datasets/{id}/items`, version-scoped or not. */
+export interface VersionedDatasetItemPage {
+  /** The server's own count, which is what the sidebar's pagination reads. */
+  total: number;
+  /** Dynamic data column names, sorted — the sheet's data columns come from these. */
+  columns: string[];
+  items: VersionedDatasetItemRef[];
 }
 
 /**
@@ -273,6 +397,17 @@ export interface PromptVersionRef {
   id: string;
   promptId: string;
   versionNumber: string | null;
+  /**
+   * The 8-character short id the backend assigns each commit — `null` when it
+   * sent none, never defaulted, for the same reason `versionNumber` is not.
+   *
+   * Load-bearing for the save-dedup specs (opik#8923): when an unchanged save
+   * is deduped the server answers with the EXISTING version rather than a new
+   * one, and `id` plus `commit` are what say which version came back. A
+   * comparison on `id` alone would also pass if the server minted a fresh
+   * commit under a recycled id.
+   */
+  commit: string | null;
   template: string;
 }
 
@@ -392,6 +527,48 @@ export interface OtelSpanSeed {
    * `extractUsageField` only reads `hasIntValue()`.
    */
   attributes: Record<string, string | number>;
+}
+
+/**
+ * One span of a `postOtelExport` export — the general OTLP shape, where the
+ * span's own routing inputs are the subject rather than protocol detail.
+ *
+ * Deliberately NOT `OtelSpanSeed` with extra fields. That seed exists to write
+ * spans onto a trace that already exists, so `postOtelSpans` sets
+ * `opik.trace_id` on every span and mints one OTLP trace id for the batch. Both
+ * of those are precisely what routing-by-attribute must be asserted WITHOUT:
+ * an `opik.trace_id` pins the spans to a trace that already belongs to a
+ * project, which is the project they would then land in whatever
+ * `opik.project_name` says.
+ */
+export interface OtelExportSpanSeed {
+  name: string;
+  /**
+   * Span-level attributes, `opik.project_name` among them when the span routes
+   * itself. Sent through the same encoder as the resource attributes.
+   */
+  attributes?: Record<string, string | number>;
+  /**
+   * This span's own OTLP trace id, as lowercase hex.
+   *
+   * Absent means the export's single shared id, which is what a real Collector
+   * batch looks like. Stated per span when the spans of ONE export must land in
+   * DIFFERENT projects: an Opik trace id is derived from the OTLP trace id
+   * (`convertOtelIdToUUIDv7`), so same-id spans fanning out to several projects
+   * collide on the per-project trace upsert and the loser is rejected with
+   * `409 Project name and workspace name do not match the existing trace`,
+   * losing its span. Giving each span its own id is the only way to make a
+   * multi-project export deterministic — see the note in the spec.
+   */
+  otelTraceIdHex?: string;
+}
+
+/** One span of a project-scoped read, carrying what OTLP routing is asserted on. */
+export interface ProjectSpanRef {
+  id: string;
+  name: string;
+  /** The Opik trace the span was stored under — minted by the service here. */
+  traceId: string;
 }
 
 /** One span of a `POST /v1/private/spans/batch` write. */
@@ -689,6 +866,17 @@ export interface SpanPayload {
 export interface ThreadDetail {
   id: string;
   projectId: string;
+  /**
+   * The thread's own row id, as distinct from `id` (the `thread_id` string the
+   * SDK caller chose). The two are not interchangeable: an annotation queue of
+   * `scope: 'thread'` takes its items by THIS id, and
+   * `POST /annotation-queues/{id}/items/add` accepts the `thread_id` string
+   * without error while adding nothing — so a seed that used the wrong one
+   * leaves an empty queue rather than a failure. `null` when the endpoint did
+   * not answer it, so a caller that needs it asserts rather than passing
+   * `'undefined'` on to the queue.
+   */
+  threadModelId: string | null;
   feedbackScores: FeedbackScoreRef[];
   /**
    * The aggregate `find_thread_by_id` computes over the thread's OWN traces —
@@ -1213,6 +1401,80 @@ function toDatasetSummary(row: unknown): DatasetSummaryRef {
   };
 }
 
+/** The evaluator shape a version or an item carries, as far as the suite surfaces read it. */
+type RawEvaluator = {
+  type?: string;
+  config?: { schema?: Array<{ name?: string }> };
+};
+
+/**
+ * The assertion names a list of evaluators resolves to, computed the way the
+ * FE's `extractAssertions` computes it: the FIRST evaluator only, and only when
+ * it is an `llm_judge`.
+ *
+ * Deliberately not "every assertion on every evaluator". The sheet's meta block
+ * and its per-item Assertions section both go through `extractAssertions`, so a
+ * spec comparing the API against the screen has to apply the same rule — a
+ * helper that flattened all of them would disagree with the UI on exactly the
+ * suite that has two evaluators, and report that disagreement as a product bug.
+ */
+function toAssertionNames(evaluators: unknown): string[] {
+  const first = (Array.isArray(evaluators) ? evaluators : [])[0] as RawEvaluator | undefined;
+  if (!first || first.type !== 'llm_judge') return [];
+  return (first.config?.schema ?? []).map((entry) => String(entry.name ?? ''));
+}
+
+/**
+ * Assertion names back into the `llm_judge` evaluator the backend stores and
+ * `extractAssertions` reads — the inverse of `toAssertionNames`.
+ *
+ * The `messages` are required by the shared LlmAsJudgeCode schema and are
+ * replaced by the backend's own copy, so their content is irrelevant here; only
+ * `schema[].name` is ever read back. Kept minimal on purpose rather than
+ * copying the FE's full default prompt, which would go stale silently.
+ */
+function packLlmJudge(assertionNames: string[]): unknown[] {
+  return [
+    {
+      name: 'llm_judge',
+      type: 'llm_judge',
+      config: {
+        version: '1',
+        name: 'llm_judge',
+        model: { name: null, temperature: null, seed: null, customParameters: null },
+        messages: [
+          { role: 'SYSTEM', content: 'replaced by the backend' },
+          { role: 'USER', content: 'replaced by the backend' },
+        ],
+        variables: { input: 'input', output: 'output' },
+        schema: assertionNames.map((name) => ({
+          name,
+          type: 'BOOLEAN',
+          description: name,
+        })),
+      },
+    },
+  ];
+}
+
+/**
+ * `{pass_threshold, runs_per_item}` onto `ExecutionPolicyRef`, keeping absence
+ * absent. A version or item that carries no policy must come back `null`,
+ * because inheriting the suite default is a distinct rendered state (grey, and
+ * showing the suite's numbers) from carrying one of your own.
+ */
+function toExecutionPolicy(raw: unknown): ExecutionPolicyRef | null {
+  const policy = raw as { pass_threshold?: number; runs_per_item?: number } | null | undefined;
+  if (!policy) return null;
+  const { pass_threshold: passThreshold, runs_per_item: runsPerItem } = policy;
+  if (typeof passThreshold !== 'number' || typeof runsPerItem !== 'number') {
+    throw new Error(
+      `toExecutionPolicy: execution_policy present but not numeric: ${JSON.stringify(policy)}`,
+    );
+  }
+  return { passThreshold, runsPerItem };
+}
+
 /** One clause of the `sorting` query param the grids serialise. */
 export interface BackendSort {
   field: string;
@@ -1341,6 +1603,22 @@ function randomOtelId(bytes: 8 | 16): string {
 /** The protobuf `bytes` encoding of a hex OTLP id. See `postOtelSpans`. */
 function hexToBase64(hex: string): string {
   return Buffer.from(hex, 'hex').toString('base64');
+}
+
+/**
+ * One attribute value as proto3 JSON `AnyValue`, shared by both OTLP exporters
+ * below so there is exactly one encoder to be right about.
+ *
+ * Numbers become `intValue` carrying a STRING, not a bare JSON number: proto3
+ * JSON represents int64 as a string, and a large count sent as a number
+ * overflows silently. There is no float case for the reason `OtelSpanSeed`
+ * gives — every numeric attribute Opik reads off an OTel span is a token count,
+ * and `extractUsageField` only reads `hasIntValue()`.
+ */
+function toOtelAnyValue(value: string | number): { intValue: string } | { stringValue: string } {
+  return typeof value === 'number'
+    ? { intValue: String(Math.trunc(value)) }
+    : { stringValue: value };
 }
 
 export function makeBackendClient(apiKey: string | null = null, workspaceName: string | null = null) {
@@ -2123,19 +2401,36 @@ export function makeBackendClient(apiKey: string | null = null, workspaceName: s
      * count creates: the label the prompt page renders comes from this field,
      * so a spec asserting on labels must compare against what the server said,
      * not against the order the fixture happened to write in.
+     *
+     * `metadata` is what decides how the front end READS the template back:
+     * `parsePromptVersionContent` only parses it as structured message content
+     * when the metadata says `{created_from: "opik_ui", type: "messages_json"}`,
+     * and treats it as plain text otherwise. A seed that wants the structured
+     * shape — a message with media parts, say — must send it.
      */
     async createPromptVersion(args: {
       name: string;
       template: string;
       projectId?: string;
       changeDescription?: string;
+      metadata?: Record<string, unknown>;
+      /**
+       * `text` or `chat`, and only honoured on the call that CREATES the prompt
+       * — the backend ignores it for a name that already exists and the
+       * structure is immutable thereafter. It decides which of the Playground's
+       * two library menus offers the prompt (the chat card's own loader filters
+       * on it), so a chat seed must set it on its first version.
+       */
+      templateStructure?: 'text' | 'chat';
     }): Promise<PromptVersionRef> {
       const created = await opik.api.prompts.createPromptVersion({
         name: args.name,
         version: {
           template: args.template,
           ...(args.changeDescription ? { changeDescription: args.changeDescription } : {}),
+          ...(args.metadata ? { metadata: args.metadata } : {}),
         },
+        ...(args.templateStructure ? { templateStructure: args.templateStructure } : {}),
         ...(args.projectId ? { projectId: args.projectId } : {}),
       });
       const id = created.id;
@@ -2149,6 +2444,7 @@ export function makeBackendClient(apiKey: string | null = null, workspaceName: s
         // (or a backend that stopped sending the field), and either is a real
         // answer a label assertion must be able to see.
         versionNumber: created.versionNumber ?? null,
+        commit: created.commit ?? null,
         template: created.template,
       };
     },
@@ -2175,8 +2471,34 @@ export function makeBackendClient(apiKey: string | null = null, workspaceName: s
         id: String(v.id ?? ''),
         promptId: v.promptId ? String(v.promptId) : promptId,
         versionNumber: v.versionNumber ?? null,
+        commit: v.commit ?? null,
         template: v.template,
       }));
+    },
+
+    /**
+     * One commit, by version id — `GET /v1/private/prompts/versions/{id}`.
+     *
+     * Exists for the half of a prompt a version row cannot answer: `metadata`,
+     * which is what tells the front end whether to read `template` as
+     * structured message content or as plain text. `listPromptVersions` does
+     * not carry it, and the shape a spec needs to compare against is the
+     * stored template plus the metadata that gives it meaning.
+     *
+     * `template` and `metadata` are returned exactly as the server sent them,
+     * including absent — a version whose template came back empty is a real
+     * answer a caller may be asserting about, and defaulting it here would
+     * erase the difference between "stored empty" and "not stored".
+     */
+    async getPromptVersion(
+      versionId: string,
+    ): Promise<{ id: string; template: string | undefined; metadata: unknown }> {
+      const version = await opik.api.prompts.getPromptVersionById(versionId);
+      return {
+        id: String(version.id ?? ''),
+        template: version.template,
+        metadata: version.metadata,
+      };
     },
 
     /**
@@ -2388,6 +2710,7 @@ export function makeBackendClient(apiKey: string | null = null, workspaceName: s
       const page = await opik.api.datasets.listDatasetVersions(datasetId, { size: 100 });
       const content = page.content ?? [];
       return content.map((v) => ({
+        id: String(v.id ?? ''),
         versionName: String(v.versionName ?? ''),
         versionHash: v.versionHash ?? null,
         itemsTotal: Number(v.itemsTotal ?? 0),
@@ -2396,6 +2719,193 @@ export function makeBackendClient(apiKey: string | null = null, workspaceName: s
         itemsDeleted: Number(v.itemsDeleted ?? 0),
         isLatest: Boolean(v.isLatest),
       }));
+    },
+
+    /**
+     * `POST /v1/private/datasets/{id}/items/changes` — the delta commit the
+     * Records tab's "Save changes" makes, exposed for the one thing no other
+     * seeding route can do: cut a new SUITE version whose assertions and
+     * execution policy differ from the previous one's.
+     *
+     * The SDK's `create_test_suite` sets `global_assertions` and the policy
+     * once, at creation, and `TestSuite.insert` carries whatever is already
+     * there forward — so through the SDK alone every version of a suite has the
+     * same policy. A spec checking that a version sheet shows the version's OWN
+     * policy rather than the latest one cannot discriminate against a seed like
+     * that: both answers look identical. This is what makes the two versions
+     * differ.
+     *
+     * `baseVersion` is the previous version's row **id**, not its hash, and the
+     * endpoint rejects a stale one with 409 rather than silently forking — so
+     * the caller must pass the version that is latest right now.
+     */
+    async applyDatasetItemChanges(args: {
+      datasetId: string;
+      /** The current latest version's `id`. */
+      baseVersionId: string;
+      addedItems?: Array<{ id: string; data: Record<string, unknown> }>;
+      deletedIds?: string[];
+      changeDescription?: string;
+      /** Version-level assertion names, packed into the llm_judge shape the FE reads. */
+      assertionNames?: string[];
+      executionPolicy?: ExecutionPolicyRef;
+    }): Promise<void> {
+      const { status, message } = await rawFetch(
+        'POST',
+        `/v1/private/datasets/${args.datasetId}/items/changes`,
+        {
+          body: {
+            added_items: (args.addedItems ?? []).map((item) => ({
+              id: item.id,
+              source: 'manual',
+              data: item.data,
+            })),
+            edited_items: [],
+            deleted_ids: args.deletedIds ?? [],
+            base_version: args.baseVersionId,
+            ...(args.changeDescription ? { change_description: args.changeDescription } : {}),
+            ...(args.assertionNames ? { evaluators: packLlmJudge(args.assertionNames) } : {}),
+            ...(args.executionPolicy
+              ? {
+                  execution_policy: {
+                    pass_threshold: args.executionPolicy.passThreshold,
+                    runs_per_item: args.executionPolicy.runsPerItem,
+                  },
+                }
+              : {}),
+          },
+        },
+      );
+      if (status !== 201) {
+        throw new Error(
+          `applyDatasetItemChanges(${args.datasetId}): expected 201, got ${status}: ${message}`,
+        );
+      }
+    },
+
+    /**
+     * One version by its hash — `GET /v1/private/datasets/{id}/versions/hash/
+     * {versionHash}`, the read the version-records sidebar makes when a row is
+     * opened.
+     *
+     * Through `rawFetch` rather than the pinned SDK client, which predates the
+     * endpoint. Throws on anything but a 200 rather than handing back a
+     * nullable ref: every caller so far is asking what a version HOLDS, and a
+     * null they would have to assert away first is just a way for a missing
+     * version to arrive as a confusing comparison instead of as the failure it
+     * is. A spec covering the endpoint's rejections — an unknown hash, or one
+     * belonging to a different dataset — wants the status, and should take it
+     * from a sibling built for that.
+     */
+    async getDatasetVersionByHash(args: {
+      datasetId: string;
+      versionHash: string;
+    }): Promise<DatasetVersionDetailRef> {
+      const { status, message, json } = await rawFetch(
+        'GET',
+        `/v1/private/datasets/${args.datasetId}/versions/hash/${args.versionHash}`,
+      );
+      if (status !== 200) {
+        throw new Error(
+          `getDatasetVersionByHash(${args.datasetId}, ${args.versionHash}): ` +
+            `answered ${status}: ${message}`,
+        );
+      }
+      const v = json as {
+        id?: string;
+        version_name?: string;
+        version_hash?: string;
+        items_total?: number;
+        items_added?: number;
+        items_modified?: number;
+        items_deleted?: number;
+        is_latest?: boolean;
+        evaluators?: unknown;
+        execution_policy?: unknown;
+      };
+      if (typeof v.version_hash !== 'string' || typeof v.version_name !== 'string') {
+        throw new Error(
+          `getDatasetVersionByHash(${args.versionHash}): 200 carried no version_hash/version_name`,
+        );
+      }
+      return {
+        id: String(v.id ?? ''),
+        versionName: v.version_name,
+        versionHash: v.version_hash,
+        itemsTotal: Number(v.items_total ?? 0),
+        itemsAdded: Number(v.items_added ?? 0),
+        itemsModified: Number(v.items_modified ?? 0),
+        itemsDeleted: Number(v.items_deleted ?? 0),
+        isLatest: Boolean(v.is_latest),
+        assertionNames: toAssertionNames(v.evaluators),
+        executionPolicy: toExecutionPolicy(v.execution_policy),
+      };
+    },
+
+    /**
+     * Items as of one version — `GET /v1/private/datasets/{id}/items` with the
+     * `version` query param the sidebar's table sends. Omit `versionHash` for
+     * the unversioned read, which is what the live Records tab makes.
+     *
+     * One page, deliberately: the server's own `total` comes back alongside the
+     * rows, so a caller can assert the whole answer — the count AND the
+     * collection — rather than hunting its own rows inside it. A version read
+     * that returned the right rows plus some it should have excluded is the
+     * failure this exists to catch, and a paging loop would hide the count the
+     * sidebar actually renders.
+     *
+     * `truncate: false` so item payloads come back whole; the markers a
+     * version-scoping spec compares live in the data.
+     */
+    async listDatasetItemsAtVersion(args: {
+      datasetId: string;
+      /** Omitted entirely when absent — a null `version` is not the same request. */
+      versionHash?: string;
+      page?: number;
+      size?: number;
+    }): Promise<VersionedDatasetItemPage> {
+      const query = new URLSearchParams({
+        page: String(args.page ?? 1),
+        size: String(args.size ?? 100),
+        truncate: 'false',
+        ...(args.versionHash ? { version: args.versionHash } : {}),
+      });
+      const { status, message, json } = await rawFetch(
+        'GET',
+        `/v1/private/datasets/${args.datasetId}/items`,
+        { query },
+      );
+      if (status !== 200) {
+        throw new Error(
+          `listDatasetItemsAtVersion(${args.datasetId}, ${args.versionHash ?? 'latest'}): ` +
+            `answered ${status}: ${message}`,
+        );
+      }
+      const body = json as {
+        total?: number;
+        columns?: Array<{ name?: string }>;
+        content?: Array<{
+          id?: string;
+          data?: Record<string, unknown>;
+          evaluators?: unknown;
+          execution_policy?: unknown;
+        }>;
+      };
+      if (typeof body.total !== 'number') {
+        throw new Error('listDatasetItemsAtVersion: response carried no `total`');
+      }
+      return {
+        total: body.total,
+        // Sorted to match the sheet, whose data columns are sorted by name
+        // before they become grid columns.
+        columns: (body.columns ?? []).map((c) => String(c.name ?? '')).sort(),
+        items: (body.content ?? []).map((item) => ({
+          id: String(item.id ?? ''),
+          data: item.data ?? {},
+          assertionNames: toAssertionNames(item.evaluators),
+          executionPolicy: toExecutionPolicy(item.execution_policy),
+        })),
+      };
     },
 
     /**
@@ -3564,15 +4074,26 @@ export function makeBackendClient(apiKey: string | null = null, workspaceName: s
      * no spans".
      */
     async listSpanCosts(args: { projectId: string; traceId: string }): Promise<SpanCostRef[]> {
-      const content = await fetchAllPages(
-        (page) =>
-          opik.api.spans.getSpansByProject({
-            projectId: args.projectId,
-            traceId: args.traceId,
-            page,
-            size: 100,
-          }),
-        100,
+      // `withRateLimitRetry`, for the same reason `listTrackedSpans` takes it:
+      // the spans listing is limited per workspace (`getSpans:{workspaceId}`),
+      // and every cost spec seeds a population and then polls this method until
+      // it is queryable — so several of them running together on a shared cloud
+      // workspace is precisely the burst the limit is there to shed. Unretried,
+      // the 429 escapes from inside the caller's `expect.poll` and fails the
+      // test, which reads like a pricing defect rather than an infrastructure
+      // budget. Observed on staging: four cost tests failing all three attempts
+      // on 429 alone, with the prices they assert never read at all.
+      const content = await withRateLimitRetry(() =>
+        fetchAllPages(
+          (page) =>
+            opik.api.spans.getSpansByProject({
+              projectId: args.projectId,
+              traceId: args.traceId,
+              page,
+              size: 100,
+            }),
+          100,
+        ),
       );
       return content.map((s) => ({
         id: String(s.id ?? ''),
@@ -5033,6 +5554,87 @@ export function makeBackendClient(apiKey: string | null = null, workspaceName: s
       }));
     },
 
+    /**
+     * One provider's curated rows from `GET /v1/private/llm/models`.
+     *
+     * `rawFetch` rather than the typed client: the pinned SDK has no binding
+     * for this endpoint at all. Same reason as `getProjectStats`.
+     *
+     * Throws when the provider is absent instead of answering `[]`. An empty
+     * list and "this provider is not in the catalog" are the same value to a
+     * caller iterating it, and the second one would make every per-model
+     * assertion below it vacuously pass — a spec that asserted nothing while
+     * reporting green.
+     */
+    async getLlmCatalogModels(provider: string): Promise<LlmCatalogModelRef[]> {
+      const { status, message, json } = await rawFetch('GET', '/v1/private/llm/models');
+      if (status !== 200) {
+        throw new Error(`getLlmCatalogModels: expected 200, got ${status}: ${message}`);
+      }
+      const byProvider = (json ?? {}) as Record<string, unknown>;
+      const rows = byProvider[provider];
+      if (!Array.isArray(rows)) {
+        throw new Error(
+          `getLlmCatalogModels: the catalog carries no '${provider}' provider ` +
+            `(it has: ${Object.keys(byProvider).join(', ') || 'nothing'})`,
+        );
+      }
+      return rows.map((row) => {
+        const model = (row ?? {}) as {
+          id?: unknown;
+          label?: unknown;
+          params?: { effort?: { accepted?: unknown; levels?: unknown; default?: unknown } };
+        };
+        const effort = model.params?.effort ?? {};
+        return {
+          id: String(model.id),
+          label: typeof model.label === 'string' ? model.label : null,
+          effort: {
+            accepted: effort.accepted === true,
+            levels: Array.isArray(effort.levels) ? effort.levels.map(String) : [],
+            default: typeof effort.default === 'string' ? effort.default : null,
+          },
+        };
+      });
+    },
+
+    /**
+     * One `POST /v1/private/chat/completions`, reported rather than thrown.
+     *
+     * The status and the message together ARE the contract here: the parameter
+     * gate opik#8928 moved onto the catalog refuses a request during mapping,
+     * before any provider is called, with a 400 whose text names the model, the
+     * effort and — when the row curates any levels — the whole supported list.
+     * A helper that threw on non-2xx would discard exactly the half a gate
+     * assertion reads.
+     *
+     * **This endpoint reaches the provider when the gate lets a request
+     * through.** A caller probing the gate must therefore send an effort the
+     * row cannot accept, which is refused for free; see
+     * `probeAnthropicEffortGate` for the sentinel that makes that reliable.
+     */
+    async postChatCompletion(args: {
+      model: string;
+      /** Lowercase roles — this endpoint deserializes langchain4j's own enum. */
+      messages?: Array<{ role: string; content: string }>;
+      customParameters?: Record<string, unknown>;
+    }): Promise<RawApiResult> {
+      const { status, message, location } = await rawFetch(
+        'POST',
+        '/v1/private/chat/completions',
+        {
+          body: {
+            model: args.model,
+            messages: args.messages ?? [{ role: 'user', content: 'Reply with the word OK.' }],
+            ...(args.customParameters === undefined
+              ? {}
+              : { custom_parameters: args.customParameters }),
+          },
+        },
+      );
+      return { status, message, location };
+    },
+
     async deleteAutomationRule(projectId: string, ruleId: string): Promise<void> {
       try {
         await opik.api.automationRuleEvaluators.deleteAutomationRuleEvaluatorBatch({
@@ -5131,6 +5733,7 @@ export function makeBackendClient(apiKey: string | null = null, workspaceName: s
       return {
         id: String(thread.id ?? ''),
         projectId: String(thread.projectId ?? ''),
+        threadModelId: thread.threadModelId ?? null,
         feedbackScores: (thread.feedbackScores ?? []).map((fs) => ({
           name: fs.name,
           value: Number(fs.value),
@@ -5234,6 +5837,54 @@ export function makeBackendClient(apiKey: string | null = null, workspaceName: s
     },
 
     /**
+     * One thread's traces, in start-time order, carrying the `metadata` the
+     * row was written with — `GET /v1/private/traces` filtered on `thread_id`,
+     * which is the exact read the thread Messages panel (`useTracesList`)
+     * issues to build its turns.
+     *
+     * Separate from `listTraceIds` for two reasons, both load-bearing for a
+     * spec about what the panel renders:
+     *
+     *  - ids alone cannot say whether a per-trace flag survived the LIST read.
+     *    `getTracePayload` reads `GET /traces/{id}`, a different query: a list
+     *    endpoint that dropped `metadata` would leave that by-id read green
+     *    while the panel, which never makes it, saw no flag at all.
+     *  - `truncate: false`, where `listTraceIds` sends `true`. Truncation is
+     *    what the table wants and the opposite of what this wants — the whole
+     *    point is to compare the metadata byte-for-byte with what was seeded.
+     *
+     * `metadata` is `unknown`: the caller asserts the shape it seeded rather
+     * than being handed a pre-digested boolean, so a flag that came back under
+     * the wrong key, or as the string `"true"`, fails instead of narrowing to
+     * the same answer as the real thing.
+     */
+    async listThreadTraces(args: {
+      projectId: string;
+      threadId: string;
+      size?: number;
+    }): Promise<Array<{ id: string; name: string; metadata: unknown }>> {
+      const page = await opik.api.traces.getTracesByProject({
+        projectId: args.projectId,
+        size: args.size ?? 200,
+        page: 1,
+        truncate: false,
+        filters: JSON.stringify([
+          { field: 'thread_id', operator: '=', value: args.threadId, type: 'string' },
+        ] satisfies BackendFilter[]),
+      });
+      // The endpoint answers newest-first; the panel renders oldest-first, and
+      // every caller here asserts on chronological order, so reverse once here
+      // rather than in each spec.
+      return (page.content ?? [])
+        .map((t) => ({
+          id: String(t.id ?? ''),
+          name: t.name ?? '',
+          metadata: t.metadata ?? null,
+        }))
+        .reverse();
+    },
+
+    /**
      * Span ids visible for a project under `filters` — `GET /v1/private/spans`,
      * the read behind the Spans table.
      *
@@ -5321,12 +5972,7 @@ export function makeBackendClient(apiKey: string | null = null, workspaceName: s
       const otelTraceId = randomOtelId(16);
       const startNanos = BigInt(Date.now()) * 1_000_000n;
 
-      const toAnyValue = (value: string | number) =>
-        typeof value === 'number'
-          ? // `String`, not the number itself: proto3 JSON represents int64 as a
-            // string, and a bare JSON number overflows silently for large counts.
-            { intValue: String(Math.trunc(value)) }
-          : { stringValue: value };
+      const toAnyValue = toOtelAnyValue;
 
       const { status, message } = await rawFetchWithHeaders(
         'POST',
@@ -5371,6 +6017,138 @@ export function makeBackendClient(apiKey: string | null = null, workspaceName: s
             `'${args.projectName}', got ${status}: ${message}`,
         );
       }
+    },
+
+    /**
+     * `POST /v1/private/otel/v1/traces` for an export that ROUTES ITSELF —
+     * resource attributes, per-span attributes, and per-span OTLP trace ids,
+     * with no `opik.trace_id` anywhere.
+     *
+     * The sibling of `postOtelSpans`, which cannot express this and should not
+     * be made to: it attaches spans to a caller-minted trace, which is the one
+     * thing an assertion about `opik.project_name` routing must not do (see
+     * `OtelExportSpanSeed`). Here the service mints the trace itself, from the
+     * OTLP trace id, in whichever project the attribute resolves to — so the
+     * caller learns which project won by reading the projects back, which is
+     * exactly the user-visible question opik#9036 is about.
+     *
+     * Three things this deliberately does differently:
+     *
+     *  - **The status is RETURNED, not thrown on.** The export's own answer is
+     *    part of what a routing spec asserts: a multi-project export that
+     *    answers `409` stores only some of its spans, and a helper that threw
+     *    would turn that into an error with no way to say "the export was
+     *    refused" apart from "the spans never landed".
+     *  - **`resourceAttributes` go on `resource.attributes`**, the level a real
+     *    Collector sets a service-wide project name at, and a different branch
+     *    of `OpenTelemetryMapper` from the span-level one — so the two can
+     *    regress apart and a spec wants to drive each.
+     *  - **No `opik.trace_id` is ever added.** Not even optionally: a caller
+     *    who wants one wants `postOtelSpans`.
+     *
+     * `projectNameHeader` is still always sent, for the reason `postOtelSpans`
+     * gives — absent, the endpoint falls back to the workspace's DEFAULT
+     * project, scattering spans outside the run prefix where no teardown will
+     * find them. It is also the fallback under test: every span whose attribute
+     * is missing or refused must land there.
+     */
+    async postOtelExport(args: {
+      /** The `projectName` header — the fallback every unrouted span must follow. */
+      projectNameHeader: string;
+      /** Export-wide attributes, on `resource.attributes`. */
+      resourceAttributes?: Record<string, string | number>;
+      spans: OtelExportSpanSeed[];
+    }): Promise<{ status: number; message: string }> {
+      if (args.spans.length === 0) {
+        throw new Error(
+          'postOtelExport: an export with no spans is a no-op the backend answers 200 for',
+        );
+      }
+      // The export's shared id, used by every span that did not state its own.
+      const sharedOtelTraceId = randomOtelId(16);
+      const startNanos = BigInt(Date.now()) * 1_000_000n;
+
+      return rawFetchWithHeaders(
+        'POST',
+        '/v1/private/otel/v1/traces',
+        { projectName: args.projectNameHeader },
+        {
+          resourceSpans: [
+            {
+              ...(args.resourceAttributes === undefined
+                ? {}
+                : {
+                    resource: {
+                      attributes: Object.entries(args.resourceAttributes).map(
+                        ([key, value]) => ({ key, value: toOtelAnyValue(value) }),
+                      ),
+                    },
+                  }),
+              scopeSpans: [
+                {
+                  spans: args.spans.map((span, index) => ({
+                    traceId: hexToBase64(span.otelTraceIdHex ?? sharedOtelTraceId),
+                    spanId: hexToBase64(randomOtelId(8)),
+                    name: span.name,
+                    // SPAN_KIND_CLIENT — what an instrumented call is.
+                    kind: 3,
+                    startTimeUnixNano: String(startNanos + BigInt(index)),
+                    endTimeUnixNano: String(startNanos + BigInt(index) + 1_000_000n),
+                    attributes: Object.entries(span.attributes ?? {}).map(
+                      ([key, value]) => ({ key, value: toOtelAnyValue(value) }),
+                    ),
+                  })),
+                },
+              ],
+            },
+          ],
+        },
+      );
+    },
+
+    /**
+     * Every span a PROJECT holds — `GET /v1/private/spans` with a project and no
+     * trace id — as `{ total, spans }`.
+     *
+     * `listSpansPage` cannot answer this: it requires a `traceId`, and a span
+     * routed by `opik.project_name` is stored under a trace the SERVICE minted,
+     * whose id the caller does not know and must not have to re-derive. "Which
+     * project holds this span" is the whole claim here, so the project is the
+     * only key the read is allowed to need.
+     *
+     * `total` comes from the envelope rather than from `spans.length`, and both
+     * are returned: a caller asserting a project holds exactly its own span
+     * needs the population as well as the rows, or an export that also leaked a
+     * span into the project would still satisfy a lookup for the expected one.
+     */
+    async listProjectSpans(args: {
+      projectId: string;
+      size?: number;
+    }): Promise<{ total: number; spans: ProjectSpanRef[] }> {
+      const answer = await withRateLimitRetry(() =>
+        withReadRetry(() =>
+          opik.api.spans.getSpansByProject({
+            projectId: args.projectId,
+            page: 1,
+            size: args.size ?? 100,
+            truncate: true,
+          }),
+        ),
+      );
+      if (typeof answer.total !== 'number') {
+        throw new Error(
+          `listProjectSpans(project ${args.projectId}): the 200 response carried no numeric ` +
+            "'total' — the envelope is what a dropped span shows up in, so it cannot be assumed.",
+        );
+      }
+      return {
+        total: answer.total,
+        spans: (answer.content ?? []).map((s) => ({
+          id: String(s.id ?? ''),
+          name: String(s.name ?? ''),
+          traceId: String(s.traceId ?? ''),
+        })),
+      };
     },
 
     /**

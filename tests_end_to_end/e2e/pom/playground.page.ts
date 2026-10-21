@@ -6,6 +6,24 @@ import { readRecordedToasts, startRecordingToasts } from './toast-recorder';
 
 export type RunExperimentSourceMode = 'dataset' | 'test_suite';
 
+/**
+ * The version `POST /v1/private/prompts/versions` answers a Playground save
+ * with, in the wire's own snake_case — this is the raw REST body, not a value
+ * that has been through the suite's typed backend client.
+ *
+ * Every field is optional because that is what the endpoint's contract allows,
+ * and a caller asserting a save deduped must be able to see an absent `commit`
+ * as the real answer it is rather than have it defaulted into a passing
+ * comparison.
+ */
+export interface SavedPromptVersionResponse {
+  id?: string;
+  prompt_id?: string;
+  commit?: string;
+  version_number?: string;
+  template?: string;
+}
+
 const escapeForRegExp = (literal: string): string =>
   literal.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
@@ -650,6 +668,155 @@ export class PlaygroundPage {
     });
   }
 
+  // ── output freshness (opik#8758) ────────────────────────────────────────
+  //
+  // An output whose run inputs have changed is marked `stale`: it stays on
+  // screen, dimmed, under a note naming what changed, rather than being cleared
+  // back to "No runs yet". Two surfaces again, and for the same reason the
+  // failure tags have two — the single-prompt panel and the grid cell gate on
+  // separate `hasOutput` expressions and pass `PlaygroundStaleOutputNote`
+  // different `compact` settings, so they regress apart and each needs its own
+  // locator. A page-wide lookup would let a grid assertion pass on a panel note.
+  //
+  // One trap for any spec that runs TWICE, measured on 2.2.91 and caused by this
+  // very change: `runFreeMode` and `runSimplePromptAndAwaitResponse` both treat
+  // the "No runs yet" placeholder disappearing as "the run finished", and a
+  // stale output keeps it gone — so they return the instant Run is pressed.
+  // `waitForRunReady` has the mirror problem on the grid: it requires every cell
+  // to be the idle placeholder, and a stale cell is not idle, so it times out
+  // instead. Wait on the output itself (`waitForPromptOutputErrors`) or on the
+  // run going idle (`waitForFreeRunIdle`).
+
+  /**
+   * The stale-output notes of the single-prompt panels.
+   *
+   * Page-scoped, which is safe only in free mode where no results table is
+   * mounted — the same constraint `promptOutputErrorTags` carries.
+   */
+  promptStaleOutputNotes(): Locator {
+    return this.page.getByTestId('playground-stale-output-note');
+  }
+
+  /** The stale-output notes inside the dataset-grid output cells. */
+  outputCellStaleNotes(): Locator {
+    return this.outputCells().getByTestId('playground-stale-output-note');
+  }
+
+  /**
+   * The rendered opacity of each single-prompt failure tag.
+   *
+   * The computed style and not the `opacity-50` class: the claim is that the
+   * user sees the tag dimmed, and reading what the browser resolved fails both
+   * when the class stops being applied and when it is renamed. The exact level
+   * is a design token, so callers compare against 1 rather than pinning 0.5 —
+   * "dimmed or not" is the whole of what this spec asserts, and pinning the
+   * token would turn a restyle into a test failure.
+   */
+  async promptOutputErrorOpacities(): Promise<number[]> {
+    return this.promptOutputErrorTags().evaluateAll((els) =>
+      els.map((e) => Number(window.getComputedStyle(e).opacity)),
+    );
+  }
+
+  /** The same reading for the dataset-grid failure tags. */
+  async outputErrorOpacities(): Promise<number[]> {
+    return this.outputErrorTags().evaluateAll((els) =>
+      els.map((e) => Number(window.getComputedStyle(e).opacity)),
+    );
+  }
+
+  /**
+   * Hover a grid cell's stale note and read the tooltip it raises.
+   *
+   * The grid renders the note `compact`, which trades the full sentence for a
+   * two-word summary and moves the sentence into the tooltip — so the tooltip
+   * is the only place the grid says WHY the cell is dimmed, and asserting the
+   * visible text alone would not cover it. Radix portals the content out of the
+   * cell, so it is read at page scope, exactly as `outputErrorTooltipText` does.
+   */
+  async staleNoteTooltipText(index = 0): Promise<string> {
+    return test.step(`hover grid stale note ${index} and read its tooltip`, async () => {
+      await this.outputCellStaleNotes().nth(index).hover();
+      const tooltip = this.page.getByRole('tooltip');
+      await expect(tooltip.first()).toBeVisible({ timeout: 10_000 });
+      return (await tooltip.first().innerText()).trim();
+    });
+  }
+
+  /**
+   * Detach the prompt loaded into variant 0, through `LoadedPromptDisplay`'s
+   * own control.
+   *
+   * By its icon, because the trigger is an icon-only `Button` whose only label
+   * is a `TooltipWrapper` — no testid, no accessible name — and these specs run
+   * against a deployed Opik, where an attribute added alongside them would not
+   * exist in the version under test. `lucide-circle-x` and NOT
+   * `lucide-x-circle`: `XCircle` is an alias re-exporting `CircleX` in
+   * lucide-react, and the class is built from the canonical name. Asserted
+   * unique before the click, so another CircleX arriving in the card fails here
+   * rather than silently detaching through some other button.
+   */
+  async detachLoadedPrompt(): Promise<void> {
+    return test.step('detach the loaded prompt from variant 0', async () => {
+      const card = this.variantCard(0);
+      // The chip sits in a strip that only expands on group-hover.
+      await card.hover();
+      const detach = card.locator('button:has(svg.lucide-circle-x)');
+      await expect(detach, 'the Detach loaded prompt control').toHaveCount(1);
+      await detach.click();
+      // Resolving only once the chip has gone is what makes this method a
+      // gesture rather than a click: the chip and the library menu share one
+      // slot in the card, so a caller asserting on state "after the detach"
+      // would otherwise be free to read it before the detach landed.
+      await expect(
+        detach,
+        'the loaded-prompt chip left the card, so the prompt really is detached',
+      ).toHaveCount(0);
+    });
+  }
+
+  /**
+   * The message ids variant 0's prompt currently holds, read from the persisted
+   * `PLAYGROUND_STATE`.
+   *
+   * Not an implementation detail a spec could do without — it is the
+   * discriminator for the false-stale case. Re-applying a prompt from the
+   * library rebuilds its messages with FRESH ids, and it is that payload (same
+   * roles, same content, different ids) which used to grey a finished output
+   * for no user edit. A spec asserting only "no note after a library load"
+   * would go green on a build where the load silently did nothing, so the id
+   * change is what makes the absence of a note mean something.
+   *
+   * Variant 0 is addressed through `promptIds[0]`, the store's own ordering,
+   * which is the order the cards render in; the card carries no prompt id.
+   * Reading localStorage follows `LogsPage.readStoredFilters` and
+   * `PromptDetailPage.readPinnedExperimentIds`.
+   */
+  async storedMessageIds(): Promise<string[]> {
+    return test.step('read variant 0\'s message ids from PLAYGROUND_STATE', async () => {
+      const ids = await this.page.evaluate(() => {
+        const raw = window.localStorage.getItem('PLAYGROUND_STATE');
+        if (!raw) return null;
+        const state = (JSON.parse(raw) as { state?: unknown }).state as
+          | {
+              promptIds?: string[];
+              promptMap?: Record<string, { messages?: Array<{ id?: string }> }>;
+            }
+          | undefined;
+        const first = state?.promptIds?.[0];
+        if (!first) return null;
+        const messages = state?.promptMap?.[first]?.messages;
+        if (!messages) return null;
+        return messages.map((m) => m.id ?? '');
+      });
+      // Asserted rather than defaulted to []: an absent store is a different
+      // failure from a prompt with no messages, and returning [] for both would
+      // let a comparison of "the ids changed" pass on two empty lists.
+      expect(ids, 'PLAYGROUND_STATE holds variant 0 and its messages').not.toBeNull();
+      return ids as string[];
+    });
+  }
+
   /**
    * Read the "<N>% pass rate" badge from the Prompt A column header.
    * Returns null if no run has completed yet.
@@ -931,6 +1098,173 @@ export class PlaygroundPage {
     );
   }
 
+  // --- The model picker's scrolling list (ArrowScrollArea) ---
+  //
+  // Everything below drives the dropdown ITSELF rather than using it to pick a
+  // known model, which is why none of it goes through `setModelForVariant`:
+  // that helper types a full model name into "Search model" before clicking, so
+  // the list it operates on is always one or two rows long and never scrolls.
+  // A spec about the scroll affordance has to filter to MANY options and leave
+  // them there.
+
+  /** Open variant `index`'s model picker and resolve once the listbox is up. */
+  async openModelPicker(index: number): Promise<void> {
+    return test.step(`open the model picker for variant ${index}`, async () => {
+      const listbox = this.page.getByRole('listbox');
+      // Same first-click-swallowed-as-hover retry as setModelForVariant.
+      await expect(async () => {
+        await this.modelPicker(index).click();
+        await expect(listbox).toBeVisible({ timeout: 2_000 });
+      }).toPass({ timeout: 15_000 });
+    });
+  }
+
+  /**
+   * Type `term` into the open picker's "Search model" box and resolve once the
+   * list holds exactly `expectedOptions` options.
+   *
+   * The count is required, not optional. Provider keys are workspace-global and
+   * the suite runs `fullyParallel`, so another spec's provider can match the
+   * same search term and quietly add its models to this list — which would send
+   * "scroll to the bottom and click the last option" into somebody else's
+   * group. Pinning the count turns that into an immediate, legible failure
+   * instead of a wrong assertion.
+   */
+  async filterModelOptions(term: string, expectedOptions: number): Promise<void> {
+    return test.step(`filter the model list to "${term}"`, async () => {
+      const listbox = this.page.getByRole('listbox');
+      await listbox.getByPlaceholder('Search model').fill(term);
+      await expect(
+        listbox.getByRole('option'),
+        `"${term}" must match exactly the ${expectedOptions} models this test seeded — ` +
+          'a different count means another provider in this workspace also matched',
+      ).toHaveCount(expectedOptions);
+    });
+  }
+
+  /** The scrolling viewport the filtered option list sits in. */
+  get modelListViewport(): Locator {
+    return this.page.getByTestId('arrow-scroll-viewport');
+  }
+
+  /**
+   * One of the list's scroll arrows.
+   *
+   * `ArrowScrollArea` MOUNTS an arrow only while that direction can still
+   * scroll, so a caller asserting an arrow is absent wants `toHaveCount(0)`
+   * rather than `toBeHidden()` — the two are different claims and only the
+   * first is the one this component makes.
+   */
+  modelListScrollArrow(direction: 'up' | 'down'): Locator {
+    return this.page.getByTestId(`scroll-${direction}-arrow`);
+  }
+
+  /** How far the option list is currently scrolled, in whole pixels. */
+  async modelListScrollTop(): Promise<number> {
+    return Math.round(await this.modelListViewport.evaluate((v) => v.scrollTop));
+  }
+
+  /** Whether the option list is longer than the box showing it. */
+  async modelListOverflows(): Promise<boolean> {
+    return this.modelListViewport.evaluate((v) => v.scrollHeight > v.clientHeight);
+  }
+
+  /** The visible height of the option list's box, in pixels. */
+  async modelListViewportHeight(): Promise<number> {
+    return this.modelListViewport.evaluate((v) => v.clientHeight);
+  }
+
+  /**
+   * Press a scroll arrow once and resolve when the list has stopped moving.
+   *
+   * The arrow scrolls with `behavior: "smooth"`, so the scrollTop right after
+   * the click is mid-animation — polled to a settled value rather than read
+   * once, and polled rather than slept on.
+   */
+  async clickModelListScrollArrow(direction: 'up' | 'down'): Promise<number> {
+    return test.step(`click the ${direction} scroll arrow`, async () => {
+      await this.modelListScrollArrow(direction).click();
+      let settled = -1;
+      await expect
+        .poll(
+          async () => {
+            const previous = settled;
+            settled = await this.modelListScrollTop();
+            return previous === settled;
+          },
+          {
+            timeout: 10_000,
+            intervals: [100, 150, 250],
+            message: 'the smooth scroll started by the arrow must come to rest',
+          },
+        )
+        .toBe(true);
+      return settled;
+    });
+  }
+
+  /**
+   * Scroll the option list to one end with the wheel, as a user would, and
+   * resolve once it is there.
+   *
+   * A wheel rather than assigning `scrollTop`: the arrows are driven by the
+   * viewport's own `onScroll`, and a programmatic assignment would be a weaker
+   * reproduction of the gesture whose effect on them is the thing under test.
+   * The delta is deliberately larger than the list so the browser clamps it at
+   * the end, which is what makes one gesture enough however long the list is.
+   */
+  async scrollModelListTo(edge: 'top' | 'bottom'): Promise<void> {
+    return test.step(`scroll the model list to the ${edge}`, async () => {
+      const overscroll = await this.modelListViewport.evaluate((v) => v.scrollHeight + 200);
+      await this.modelListViewport.hover();
+      await this.page.mouse.wheel(0, edge === 'bottom' ? overscroll : -overscroll);
+      await expect
+        .poll(
+          async () =>
+            this.modelListViewport.evaluate(
+              (v, atBottom) =>
+                atBottom
+                  ? Math.ceil(v.scrollTop) >= v.scrollHeight - v.clientHeight
+                  : v.scrollTop === 0,
+              edge === 'bottom',
+            ),
+          { timeout: 10_000, message: `the option list must come to rest at its ${edge}` },
+        )
+        .toBe(true);
+    });
+  }
+
+  /**
+   * Click one option of the open, filtered list by its exact label, and resolve
+   * once the popover has closed.
+   *
+   * Scoped to `providerGroup` for the same reason `selectModelFromProvider` is:
+   * while the search box holds text the list is flat and grouped by provider,
+   * and a workspace-global provider seeded by a parallel spec can offer a model
+   * under the same label.
+   */
+  async chooseModelOption(providerGroup: string, modelDisplayName: string): Promise<void> {
+    return test.step(`click the option "${modelDisplayName}"`, async () => {
+      assertAllowedModelDisplayName(modelDisplayName);
+      const listbox = this.page.getByRole('listbox');
+      const group = listbox.getByRole('group', { name: providerGroup, exact: true });
+      await expect(group, `the ${providerGroup} provider group`).toHaveCount(1);
+      const option = group.getByRole('option', { name: modelDisplayName, exact: true });
+      await expect(option, `"${modelDisplayName}" under ${providerGroup}`).toHaveCount(1);
+      await option.click();
+      await expect(
+        listbox,
+        'clicking an option must close the picker — a click the scroll arrow ' +
+          'swallowed instead would leave it open',
+      ).toBeHidden();
+    });
+  }
+
+  /** The model name variant `index`'s picker currently displays. */
+  async selectedModelLabel(index: number): Promise<string> {
+    return ((await this.modelPicker(index).textContent()) ?? '').trim();
+  }
+
   /**
    * A named control's label inside the open model-parameters panel.
    *
@@ -955,9 +1289,30 @@ export class PlaygroundPage {
    * number input), which is why callers assert `toHaveCount(1)` before reading
    * it rather than taking `.first()`. The FE should grow a
    * `data-testid="reasoning-effort-select"` here and this should move to it.
+   *
+   * Shares {@link effortSelectTrigger} with the Anthropic reader below, since
+   * either panel mounts exactly one of these.
    */
   reasoningEffortTrigger(): Locator {
-    return this.modelParametersPanel().getByRole('combobox');
+    return this.effortSelectTrigger();
+  }
+
+  /**
+   * The Anthropic effort control's trigger inside the open model-parameters
+   * panel — the same single combobox as {@link reasoningEffortTrigger}, since a
+   * panel serves one provider at a time.
+   *
+   * Addressed by role rather than by its label even though `SelectBox` does put
+   * the id on the trigger (so `getByLabel('Thinking effort')` resolves): the
+   * label itself is under test. `AnthropicModelConfigs` renders "Effort" instead
+   * of "Thinking effort" for a model declaring `effortWithoutThinking`, because
+   * there the level changes answer length and tool use without turning thinking
+   * on — so a label-based locator would silently stop matching on exactly the
+   * model whose labelling is the assertion. Read the label with
+   * {@link modelParameterLabel} and the value through here.
+   */
+  thinkingEffortTrigger(): Locator {
+    return this.effortSelectTrigger();
   }
 
   /**
@@ -970,11 +1325,19 @@ export class PlaygroundPage {
    * is the subject of opik#8682, not an artefact of this reader.
    */
   async readReasoningEffort(): Promise<string> {
-    return test.step('read the displayed reasoning effort', async () => {
-      const trigger = this.reasoningEffortTrigger();
-      await expect(trigger, 'the panel mounts exactly one reasoning-effort control').toHaveCount(1);
-      return ((await trigger.textContent()) ?? '').trim();
-    });
+    return test.step('read the displayed reasoning effort', async () => this.readEffortValue());
+  }
+
+  /**
+   * The Anthropic effort the panel currently DISPLAYS.
+   *
+   * Which is not always what the config holds: `resolveEffort` falls back to
+   * the model's default for a stored level the selected model does not offer,
+   * which is exactly what a model switch has to be read through — the panel is
+   * the only place the reconciled level is visible before a Run.
+   */
+  async readThinkingEffort(): Promise<string> {
+    return test.step('read the displayed thinking effort', async () => this.readEffortValue());
   }
 
   /**
@@ -987,40 +1350,54 @@ export class PlaygroundPage {
    * read from the page's listbox rather than from inside the panel.
    */
   async reasoningEffortOptions(): Promise<string[]> {
-    return test.step('read the offered reasoning efforts', async () => {
-      const trigger = this.reasoningEffortTrigger();
-      await expect(trigger, 'the panel mounts exactly one reasoning-effort control').toHaveCount(1);
-      const listbox = this.page.getByRole('listbox');
-      await expect(async () => {
-        await trigger.click();
-        await expect(listbox).toBeVisible({ timeout: 2_000 });
-      }).toPass({ timeout: 15_000 });
+    return test.step('read the offered reasoning efforts', async () => this.readEffortOptions());
+  }
 
-      const options = await listbox.getByRole('option').allTextContents();
-      await this.page.keyboard.press('Escape');
-      await expect(listbox).toBeHidden();
-      return options.map((o) => o.trim());
-    });
+  /**
+   * Every Anthropic effort the control OFFERS, in the order the panel lists them.
+   *
+   * The whole list is the assertion, not just "Off is there":
+   * `getAnthropicThinkingEffortOptions` prepends Off only for a model that
+   * thinks solely when asked, and each model declares its own level set — so
+   * "Off was added" and "the levels behind it are unchanged" are separate
+   * claims a caller wants to make in one go. A build that lost the Off choice
+   * and one that lost the whole control look identical through a single
+   * negative.
+   */
+  async thinkingEffortOptions(): Promise<string[]> {
+    return test.step('read the offered thinking efforts', async () => this.readEffortOptions());
   }
 
   /** Pick a reasoning effort by its rendered label, e.g. `Max`. */
   async selectReasoningEffort(label: string): Promise<void> {
     return test.step(`select reasoning effort "${label}"`, async () => {
-      const trigger = this.reasoningEffortTrigger();
-      await expect(trigger, 'the panel mounts exactly one reasoning-effort control').toHaveCount(1);
-      const listbox = this.page.getByRole('listbox');
-      await expect(async () => {
-        await trigger.click();
-        await expect(listbox).toBeVisible({ timeout: 2_000 });
-      }).toPass({ timeout: 15_000 });
-
-      const option = listbox.getByRole('option', { name: label, exact: true });
-      // Exactly one, not `.first()`: "High" and "xHigh" are both offered, and
-      // an ambiguous match would silently store the wrong effort.
-      await expect(option, `"${label}" is offered`).toHaveCount(1);
-      await option.click();
-      await expect(listbox).toBeHidden();
+      await this.pickEffort(label);
     });
+  }
+
+  /** Pick an Anthropic thinking effort by its rendered label, e.g. `Off`. */
+  async selectThinkingEffort(label: string): Promise<void> {
+    return test.step(`select thinking effort "${label}"`, async () => {
+      await this.pickEffort(label);
+      // The trigger, not the config: a click Radix swallowed mid-remount would
+      // otherwise leave the caller asserting the next step against the level it
+      // meant to leave behind. Exact, so picking "High" cannot be satisfied by
+      // a trigger still reading "xHigh".
+      await expect(this.thinkingEffortTrigger()).toHaveText(label);
+    });
+  }
+
+  /**
+   * The note that replaces the sampling controls while Claude can think.
+   *
+   * Its WORDING is load-bearing, which is why this returns the element rather
+   * than a boolean: the panel names the parameters the surface can actually
+   * store, so the playground's two-parameter sentence and the judge rule's
+   * temperature-only one are different strings, and a surface rendering the
+   * other one is telling the user to go and set a control that is not there.
+   */
+  samplingOffNote(): Locator {
+    return this.modelParametersPanel().getByText(/(?:are|is) off while Claude can think/);
   }
 
   /** Every slider control mounted in the open panel, by its control id. */
@@ -1068,16 +1445,24 @@ export class PlaygroundPage {
 
     const promptRow = menu.getByRole('button').filter({ hasText: promptName }).first();
     await promptRow.waitFor({ state: 'visible' });
-    await promptRow.hover();
 
     const versionSubmenu = this.page.getByTestId('prompt-versions-submenu');
-    await versionSubmenu.waitFor({ state: 'visible' });
 
-    await versionSubmenu
-      .getByRole('button')
-      .filter({ has: this.page.getByText(versionLabel, { exact: true }) })
-      .first()
-      .click();
+    // The hover and the click are retried as a PAIR, and the search above is
+    // not: `PromptsSelectBox` mounts the menu with `refetchOnMount`, so the
+    // list can re-render under the cursor and detach the version submenu
+    // between opening it and clicking into it. Re-hovering re-opens it against
+    // the row that is mounted now; re-filling the search box would reset the
+    // list and lose the hover that opens the submenu at all.
+    await expect(async () => {
+      await promptRow.hover();
+      await expect(versionSubmenu).toBeVisible({ timeout: 2_000 });
+      await versionSubmenu
+        .getByRole('button')
+        .filter({ has: this.page.getByText(versionLabel, { exact: true }) })
+        .first()
+        .click({ timeout: 2_000 });
+    }).toPass({ timeout: 20_000 });
   }
 
   async loadPromptVersionFromLibrary(promptName: string, versionLabel: string): Promise<void> {
@@ -1116,6 +1501,300 @@ export class PlaygroundPage {
       await this.variantMessage(0, 'user').hover();
       await expect(card.getByText(promptName)).toBeVisible();
       await expect(card.getByText(versionLabel, { exact: true })).toBeVisible();
+    });
+  }
+
+  // ── message rows addressed by index ─────────────────────────────────────
+  //
+  // `variantMessage` above addresses a row by `data-role`, which is right for a
+  // card whose roles are known and distinct. It cannot be used by a spec that
+  // CHANGES a row's role: the Playground's default card opens with a System row
+  // and a User row, so switching the User row to System leaves two rows
+  // answering to `[data-role="system"]` and the locator becomes ambiguous — it
+  // resolves to the wrong one rather than failing. Index is stable across a role
+  // change because the role dropdown does not reorder the card.
+
+  /** Variant 0's message rows, in render order. */
+  messageRows(variantIndex = 0): Locator {
+    return this.variantCard(variantIndex).getByTestId('playground-message-row');
+  }
+
+  /** One message row of a variant card, by position rather than by role. */
+  messageRowAt(messageIndex: number, variantIndex = 0): Locator {
+    return this.messageRows(variantIndex).nth(messageIndex);
+  }
+
+  /** The role label a row's own dropdown trigger displays, e.g. "System". */
+  async messageRoleAt(messageIndex: number, variantIndex = 0): Promise<string> {
+    return test.step(`read the role of message ${messageIndex}`, async () => {
+      const row = this.messageRowAt(messageIndex, variantIndex);
+      // `data-role` carries the store's value and the trigger carries what the
+      // user reads; the trigger is the one asserted, so a card that kept the
+      // attribute while rendering another label fails rather than passes.
+      return (await row.locator('button').first().innerText()).trim();
+    });
+  }
+
+  /**
+   * Change a message row's role through the dropdown a user would use.
+   *
+   * Resolves only once the trigger shows the new role, so a caller reading the
+   * row's content "after the switch" cannot read it before the switch landed.
+   * The dropdown is a Radix checkbox menu, so the item carries the
+   * `menuitemcheckbox` role rather than `option`.
+   */
+  async setMessageRole(
+    messageIndex: number,
+    role: 'System' | 'Assistant' | 'User',
+    variantIndex = 0,
+  ): Promise<void> {
+    return test.step(`switch message ${messageIndex} to ${role}`, async () => {
+      const row = this.messageRowAt(messageIndex, variantIndex);
+      await row.locator('button').first().click();
+      await this.page.getByRole('menuitemcheckbox', { name: role, exact: true }).click();
+      await expect(
+        row.locator('button').first(),
+        `message ${messageIndex} is now a ${role} message`,
+      ).toHaveText(role);
+    });
+  }
+
+  /**
+   * Hover a message row so the strip holding its load button, its save button
+   * and its loaded-prompt chip is on screen.
+   *
+   * That strip is `invisible group-hover:visible [.group:focus-within_&]:visible`,
+   * so none of those three is VISIBLE until the row is hovered or focused —
+   * which makes this a precondition of every visibility assertion about them,
+   * not a convenience. Typing into the row's editor focuses it and has the same
+   * effect, so a spec that has just edited the message does not need this.
+   */
+  async hoverMessageRow(messageIndex: number, variantIndex = 0): Promise<void> {
+    return test.step(`hover message ${messageIndex}`, async () => {
+      await this.messageRowAt(messageIndex, variantIndex).hover();
+    });
+  }
+
+  /**
+   * Assert a message row's chip shows the given prompt at the given version.
+   *
+   * The row-scoped counterpart of `waitForLoadedPromptVersion`, which addresses
+   * variant 0's User row specifically and so cannot see a load into a System or
+   * Assistant row.
+   *
+   * Two races make this a poll rather than two `toBeVisible()` calls, and both
+   * have been seen on staging.
+   *
+   * **The hover is re-applied on every attempt.** The strip holding the chip is
+   * `invisible group-hover:visible`, so it is on screen only while the cursor is
+   * over the row — and applying a loaded prompt REBUILDS the message rows as
+   * fresh DOM nodes. A single `hover()` is one synthetic mouse move: once the
+   * node under the cursor has been replaced nothing re-fires it, so the strip
+   * goes hidden again and a plain `toBeVisible()` waits out its whole timeout
+   * watching a hidden element it can never un-hide.
+   *
+   * **The store has to have the content, not just the chip the name.** The chip
+   * and the persisted messages are written by different effects and the chip
+   * wins, so settling on the chip alone hands the caller a row whose stored
+   * content is still its PRE-LOAD value — empty, on the default card. Every
+   * caller then reads `storedMessages()` and compares, so that is a wrong
+   * answer rather than a slow one.
+   *
+   * The store condition is deliberately only "the row has content at all",
+   * which is weaker than any caller's claim: whether that content is the exact
+   * string, or the exact array with its media parts intact, is what the
+   * assertions at the call sites are for. Waiting on the full claim would make
+   * them restate this wait and assert nothing of their own.
+   */
+  async waitForLoadedPromptVersionInMessage(
+    messageIndex: number,
+    promptName: string,
+    versionLabel: string,
+    variantIndex = 0,
+  ): Promise<void> {
+    return test.step(
+      `wait for "${promptName}" ${versionLabel} to be loaded into message ${messageIndex}`,
+      async () => {
+        const row = this.messageRowAt(messageIndex, variantIndex);
+        const chip = this.loadedPromptChip(messageIndex, promptName, variantIndex);
+        const version = row.getByText(versionLabel, { exact: true });
+        await expect
+          .poll(
+            async () => {
+              await this.messageRowAt(messageIndex, variantIndex).hover();
+              if (!(await chip.isVisible()) || !(await version.isVisible())) return false;
+              const content = (await this.readStoredMessages())?.[messageIndex]?.content;
+              return Array.isArray(content)
+                ? content.length > 0
+                : typeof content === 'string' && content.length > 0;
+            },
+            {
+              timeout: 30_000,
+              intervals: [250, 500, 1_000],
+              message:
+                `message ${messageIndex} never ended up holding "${promptName}" at ` +
+                `${versionLabel} — chip and persisted content both have to land`,
+            },
+          )
+          .toBe(true);
+      },
+    );
+  }
+
+  /**
+   * A media tag in a message row, addressed by the URL it displays.
+   *
+   * By its text and not by the delete button inside it: that button is
+   * `hidden` until the tag itself is hovered, which keeps it out of the
+   * accessibility tree, so `getByRole('button', { name: 'Delete image' })`
+   * finds nothing whether or not the tag is there — the exact failure mode an
+   * absence assertion must not have. `MediaTagsList` renders the URL verbatim
+   * as the tag's text (the truncation is CSS), so an exact text match addresses
+   * one tag and reads as what the user sees.
+   */
+  mediaTag(messageIndex: number, url: string, variantIndex = 0): Locator {
+    return this.messageRowAt(messageIndex, variantIndex).getByText(url, { exact: true });
+  }
+
+  /**
+   * Open a message row's prompt-library menu and load one version into THAT
+   * row — the per-row control, which is what carries the target message's role
+   * into the load (opik#8873).
+   *
+   * The actions strip is `invisible group-hover:visible`, so the row is hovered
+   * before the button is addressed, exactly as `loadTextPromptVersionFromLibrary`
+   * does for the User row.
+   */
+  async loadTextPromptVersionIntoMessage(
+    messageIndex: number,
+    promptName: string,
+    versionLabel: string,
+    variantIndex = 0,
+  ): Promise<void> {
+    return test.step(
+      `load text prompt "${promptName}" ${versionLabel} into message ${messageIndex}`,
+      async () => {
+        const row = this.messageRowAt(messageIndex, variantIndex);
+        await row.hover();
+        await row.getByTestId('load-text-prompt-button').click();
+
+        await this.navigateLibraryMenuToVersion(promptName, versionLabel);
+      },
+    );
+  }
+
+  /**
+   * The loaded-prompt chip in a message row — present only once a library
+   * prompt is linked to it, since the chip and the load button share the one
+   * slot `PromptsSelectBox` renders into.
+   *
+   * By the prompt's own name, so a chip belonging to another row (or to a load
+   * that linked the wrong prompt) is not what gets read.
+   */
+  loadedPromptChip(messageIndex: number, promptName: string, variantIndex = 0): Locator {
+    return this.messageRowAt(messageIndex, variantIndex).getByText(promptName, { exact: true });
+  }
+
+  /**
+   * The amber dot `LoadedPromptDisplay` puts on the chip when the message no
+   * longer matches the version it was loaded from.
+   *
+   * A class-scoped CSS selector, which is a last resort and deliberate: the dot
+   * is a bare decorative `<span>` with no text, no role and no testid, and
+   * adding one would mean touching `apps/opik-frontend` from a spec that has to
+   * run against a deployed Opik built without it. Scoped to the row, and
+   * `saveTooltipText` below asserts the same flag through its own independent
+   * text handle — so a renamed utility class shows up as one of the two
+   * assertions disagreeing rather than as a silent pass.
+   */
+  unsavedChangesDot(messageIndex: number, variantIndex = 0): Locator {
+    return this.messageRowAt(messageIndex, variantIndex).locator('span.rounded-full.bg-warning');
+  }
+
+  /**
+   * Hover a row's save-to-library button and read the tooltip it raises.
+   *
+   * The tooltip is the user-readable half of the same `saveWarning` flag the
+   * dot renders: "Save to prompt library" when the message still matches the
+   * loaded version, and "This prompt version hasn't been saved" when it does
+   * not. Radix portals the content out of the row, so it is read at page scope.
+   */
+  async saveTooltipText(messageIndex: number, variantIndex = 0): Promise<string> {
+    return test.step(`read message ${messageIndex}'s save tooltip`, async () => {
+      const row = this.messageRowAt(messageIndex, variantIndex);
+      await row.hover();
+      const save = row.getByTestId('save-text-prompt-button');
+      await expect(save, 'the row offers a save-to-library button').toHaveCount(1);
+      await save.hover();
+      const tooltip = this.page.getByRole('tooltip');
+      await expect(tooltip.first()).toBeVisible({ timeout: 10_000 });
+      return (await tooltip.first().innerText()).trim();
+    });
+  }
+
+  /**
+   * Variant 0's messages as the persisted `PLAYGROUND_STATE` holds them —
+   * role and content, not just the ids `storedMessageIds` reads.
+   *
+   * The store is the only place the SHAPE of a message's content is observable.
+   * On a system or assistant row the editor renders the text part either way,
+   * and the media tags never render there at all (`showMediaActions` gates them
+   * on the user role), so "the media was dropped" and "the media is still in
+   * the message but invisible" look identical on screen — and the second is
+   * precisely the bug opik#8873 fixed. Reading localStorage follows
+   * `storedMessageIds` and `LogsPage.readStoredFilters`.
+   */
+  async storedMessages(): Promise<Array<{ id: string; role: string; content: unknown }>> {
+    return test.step('read variant 0\'s messages from PLAYGROUND_STATE', async () => {
+      const messages = await this.readStoredMessages();
+      // Asserted rather than defaulted to []: an absent store is a different
+      // failure from a prompt with no messages, and an empty array would
+      // satisfy a "no media in any message" check without reading anything.
+      expect(messages, 'PLAYGROUND_STATE holds variant 0 and its messages').not.toBeNull();
+      return messages as Array<{ id: string; role: string; content: unknown }>;
+    });
+  }
+
+  /**
+   * The same read as {@link storedMessages}, without the `test.step` or the
+   * not-null assertion.
+   *
+   * Exists so a poll can call it repeatedly: wrapped in a step it would stamp
+   * one entry per attempt onto the trace and bury the phase being waited for,
+   * and the assertion would fail the poll outright on the first tick before the
+   * store exists rather than waiting for it.
+   */
+  private async readStoredMessages(): Promise<
+    Array<{ id: string; role: string; content: unknown }> | null
+  > {
+    return this.page.evaluate(() => {
+      const raw = window.localStorage.getItem('PLAYGROUND_STATE');
+      if (!raw) return null;
+      const state = (JSON.parse(raw) as { state?: unknown }).state as
+        | {
+            promptIds?: string[];
+            promptMap?: Record<
+              string,
+              { messages?: Array<{ id?: string; role?: string; content?: unknown }> }
+            >;
+          }
+        | undefined;
+      const first = state?.promptIds?.[0];
+      if (!first) return null;
+      const stored = state?.promptMap?.[first]?.messages;
+      if (!stored) return null;
+      return stored.map((m) => ({
+        id: m.id ?? '',
+        role: m.role ?? '',
+        content: m.content,
+      }));
+    });
+  }
+
+  /** Type into one message row of variant 0, addressed by position. */
+  async fillMessageAt(messageIndex: number, text: string, variantIndex = 0): Promise<void> {
+    return test.step(`type into message ${messageIndex}`, async () => {
+      await this.fillMessageBody(this.messageRowAt(messageIndex, variantIndex), text);
     });
   }
 
@@ -1189,6 +1868,46 @@ export class PlaygroundPage {
       await this.variantCard(0).hover();
       await this.page.getByTestId('playground-save-prompt-button').click();
       await this.submitSaveDialog();
+    });
+  }
+
+  /**
+   * Save variant 0's chat prompt in "Update existing" mode and hand back the
+   * version the server answered with.
+   *
+   * Exists because `POST /v1/private/prompts/versions` answers 200 whether it
+   * committed a new version or deduped an unchanged save onto the existing one
+   * (opik#8923) — the status says nothing, and `id`/`commit`/`version_number`
+   * in the body are the only place the two outcomes differ. A spec about the
+   * dedup therefore has to read the response, not just the page afterwards: the
+   * page settling on "v3" would also be satisfied by a server that minted v4
+   * and a timeline that had not refetched.
+   */
+  async savePromptToLibraryCapturingVersion(): Promise<SavedPromptVersionResponse> {
+    return test.step('save prompt to library and capture the version the server returned', async () => {
+      await this.variantCard(0).hover();
+      await this.page.getByTestId('playground-save-prompt-button').click();
+
+      // Armed before the submit, not after: the save is one request and its
+      // response can land before the dialog has finished animating closed, so a
+      // wait registered after `submitSaveDialog` returns can miss it entirely.
+      const posted = this.page.waitForResponse(
+        (res) =>
+          res.url().includes('/v1/private/prompts/versions') &&
+          res.request().method() === 'POST',
+      );
+      await this.submitSaveDialog();
+      const response = await posted;
+
+      const status = response.status();
+      if (status !== 200) {
+        throw new Error(
+          `save to library answered ${status}: ${await response.text()}` +
+            ' — the save itself failed, so nothing downstream is about the dedup',
+        );
+      }
+
+      return (await response.json()) as SavedPromptVersionResponse;
     });
   }
 
@@ -1320,18 +2039,112 @@ export class PlaygroundPage {
     return this.page.getByTestId(`${controlId}-input`);
   }
 
-  /** The Thinking effort dropdown. Its text is the effort the panel claims. */
-  thinkingEffortSelect(): Locator {
-    return this.modelParametersPanel().getByLabel('Thinking effort');
+  /**
+   * The THUMB of a named slider control, which carries the control's live range.
+   *
+   * `SliderInputControl` puts the control id on the Slider root (`<id>-slider`)
+   * and Radix renders the thumb inside it with `role="slider"`, so the root is
+   * the only handle that scopes a range read to one control. Neither carries a
+   * testid; one added now would be missing from the deployed versions this
+   * suite also runs against — the same trade-off `modelParametersTrigger`
+   * carries.
+   */
+  sliderThumb(controlId: string): Locator {
+    return this.modelParametersPanel().locator(`#${controlId}-slider`).getByRole('slider');
   }
 
-  /** Pick a Thinking effort by its displayed label. */
-  async selectThinkingEffort(label: string): Promise<void> {
-    return test.step(`select thinking effort "${label}"`, async () => {
-      await this.thinkingEffortSelect().click();
-      await this.page.getByRole('option', { name: label, exact: true }).click();
-      await expect(this.thinkingEffortSelect()).toHaveText(label);
+  /**
+   * The minimum and maximum a named slider control currently offers.
+   *
+   * Read off the thumb's `aria-value*` attributes: that is what Radix derives
+   * from the control's own `min`/`max` props and what assistive technology is
+   * told, so a panel rendering a stale range fails here. Asserted unique
+   * first — a control mounted twice would otherwise have its range read from
+   * whichever the DOM ordered first.
+   *
+   * Both attributes are asserted present before being converted, rather than
+   * defaulted: `Number(null)` is 0, which is a plausible-looking floor and
+   * would make a missing attribute read as a real measurement.
+   */
+  async readSliderRange(controlId: string): Promise<{ min: number; max: number }> {
+    return test.step(`read the ${controlId} range`, async () => {
+      const thumb = this.sliderThumb(controlId);
+      await expect(thumb, `exactly one "${controlId}" slider is mounted`).toHaveCount(1);
+      const [min, max] = await Promise.all([
+        thumb.getAttribute('aria-valuemin'),
+        thumb.getAttribute('aria-valuemax'),
+      ]);
+      expect(min, `the ${controlId} slider reports a minimum`).not.toBeNull();
+      expect(max, `the ${controlId} slider reports a maximum`).not.toBeNull();
+      return { min: Number(min), max: Number(max) };
     });
+  }
+
+  /**
+   * Type a value into a named slider control's number input and commit it.
+   *
+   * The click is load-bearing and not redundant with `fill()`: it moves the
+   * pointer off the gear trigger, whose hover tooltip would otherwise sit above
+   * the menu and swallow the Escape that `closeModelParameters` sends.
+   * `SliderInputControl` writes through to the config on blur, so the blur is
+   * what commits — a value left focused is still only local state.
+   */
+  async setSliderValue(controlId: string, value: string): Promise<void> {
+    return test.step(`set ${controlId} to ${value}`, async () => {
+      const input = this.sliderInput(controlId);
+      await input.click();
+      await input.fill(value);
+      await input.blur();
+    });
+  }
+
+  /**
+   * Type a value into a named slider control and commit it to the config.
+   *
+   * Three steps, each of which the control needs:
+   *  - a real click first, not just `fill()`: it moves the pointer off the gear,
+   *    whose hover tooltip would otherwise sit above the menu and swallow the
+   *    Escape that {@link closeModelParameters} sends;
+   *  - `fill()`;
+   *  - a blur, because `SliderInputControl` writes through `onChange` on blur
+   *    (or Enter/Tab/Escape) only, so a value left focused is displayed but not
+   *    stored, and the next Run would carry the old one.
+   *
+   * Asserted back off the control afterwards: a value the control clamped to
+   * its own min/max is silently not the one the caller asked for, and a spec
+   * comparing the request against "the value I set" would then be comparing it
+   * against a number that was never in the config.
+   *
+   * Distinct from {@link setSliderValue}, which deliberately does NOT read the
+   * value back: the max-output-tokens specs set values ABOVE the cap and BELOW
+   * the floor precisely to assert the control clamps them, so a read-back
+   * assertion there would fail on the behaviour under test.
+   */
+  async setModelParameterSlider(controlId: string, value: string): Promise<void> {
+    return test.step(`set ${controlId} to ${value}`, async () => {
+      const input = this.sliderInput(controlId);
+      await input.click();
+      await input.fill(value);
+      await input.blur();
+      await expect(
+        input,
+        `${controlId} holds ${value} — a clamped or rejected value is not the one under test`,
+      ).toHaveValue(value);
+    });
+  }
+
+  /**
+   * The hint line a named slider control renders beneath itself — for Max
+   * output tokens, the "No limit" note `getNoOutputLimitHint` returns at 0.
+   *
+   * `SliderInputControl` renders it as a `<p>` immediately after the Slider
+   * root and only when a hint is passed, so its ABSENCE is as much the
+   * assertion as its text; hence a locator rather than a text read. Addressed
+   * through the slider's id because the hint has no handle of its own, and a
+   * panel-wide text lookup would match whichever control happened to show one.
+   */
+  sliderHint(controlId: string): Locator {
+    return this.modelParametersPanel().locator(`#${controlId}-slider ~ p`);
   }
 
   /** Type a prompt into variant 0's User message row. */
@@ -1348,7 +2161,85 @@ export class PlaygroundPage {
     });
   }
 
+  /**
+   * Wait until a free-mode run has finished and the playground is idle again.
+   *
+   * The Run button is the signal: it is swapped for Stop while a run is in
+   * flight, so "back in run/re-run mode" is exactly "safe to touch the model
+   * picker or the parameters panel again". A spec that drives several models in
+   * one page session needs that between cases — the completion POST goes out as
+   * the run STARTS, so capturing the body says nothing about the run being
+   * over. `waitForRunSettled` is the dataset-mode counterpart and watches the
+   * experiment-name editor, which free mode never renders.
+   */
+  async waitForFreeRunIdle(timeoutMs = 60_000): Promise<void> {
+    return test.step('wait for the free-mode run to go idle', async () => {
+      await expect(
+        this.runButton(),
+        'the run finished and the playground is idle again',
+      ).toBeVisible({ timeout: timeoutMs });
+    });
+  }
+
   // ── private helpers ─────────────────────────────────────────────────────
+
+  /**
+   * The one effort `Select` the open model-parameters panel mounts.
+   *
+   * Shared by the OpenAI reasoning-effort and Anthropic thinking-effort
+   * readers: a panel serves a single provider, and every other control it
+   * renders is a `SliderInputControl` number input or a sampling radio — so
+   * "the panel's only combobox" is the effort dropdown whichever provider is
+   * selected. Callers assert `toHaveCount(1)` before reading it rather than
+   * taking `.first()`, so a panel that grew a second dropdown fails loudly
+   * instead of reading whichever one happened to come first.
+   */
+  private effortSelectTrigger(): Locator {
+    return this.modelParametersPanel().getByRole('combobox');
+  }
+
+  private async readEffortValue(): Promise<string> {
+    const trigger = this.effortSelectTrigger();
+    await expect(trigger, 'the panel mounts exactly one effort control').toHaveCount(1);
+    return ((await trigger.textContent()) ?? '').trim();
+  }
+
+  /**
+   * Open the effort dropdown, read every option, close it again.
+   *
+   * The options render in a portal, so they are read from the page's listbox
+   * rather than from inside the panel.
+   */
+  private async readEffortOptions(): Promise<string[]> {
+    const listbox = await this.openEffortListbox();
+    const options = await listbox.getByRole('option').allTextContents();
+    await this.page.keyboard.press('Escape');
+    await expect(listbox).toBeHidden();
+    return options.map((o) => o.trim());
+  }
+
+  private async pickEffort(label: string): Promise<void> {
+    const listbox = await this.openEffortListbox();
+    const option = listbox.getByRole('option', { name: label, exact: true });
+    // Exactly one, not `.first()`: "High" and "xHigh" are both offered, and
+    // an ambiguous match would silently store the wrong effort.
+    await expect(option, `"${label}" is offered`).toHaveCount(1);
+    await option.click();
+    await expect(listbox).toBeHidden();
+  }
+
+  private async openEffortListbox(): Promise<Locator> {
+    const trigger = this.effortSelectTrigger();
+    await expect(trigger, 'the panel mounts exactly one effort control').toHaveCount(1);
+    const listbox = this.page.getByRole('listbox');
+    // Retried: the panel remounts when /llm/models and the provider-key query
+    // resolve, which detaches the trigger mid-click.
+    await expect(async () => {
+      await trigger.click();
+      await expect(listbox).toBeVisible({ timeout: 2_000 });
+    }).toPass({ timeout: 15_000 });
+    return listbox;
+  }
 
   /**
    * The gear button that opens a variant's model parameters.
