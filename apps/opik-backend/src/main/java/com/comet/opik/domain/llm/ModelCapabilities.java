@@ -3,7 +3,7 @@ package com.comet.opik.domain.llm;
 import com.comet.opik.api.LlmProvider;
 import com.comet.opik.api.ModelCostData;
 import com.comet.opik.api.ModelParams;
-import com.comet.opik.domain.cost.CostService;
+import com.comet.opik.domain.cost.ModelPriceTable;
 import com.comet.opik.infrastructure.llm.LlmModelRegistryService;
 import com.comet.opik.infrastructure.llm.antropic.AnthropicModelName;
 import com.comet.opik.utils.JsonUtils;
@@ -320,12 +320,12 @@ public class ModelCapabilities {
 
     private Map<String, ModelCapability> loadCapabilities() {
         try {
-            Map<String, ModelCostData> rawData = JsonUtils.readJsonFile(CostService.MODEL_PRICES_FILE,
+            Map<String, ModelCostData> rawData = JsonUtils.readJsonFile(ModelPriceTable.MODEL_PRICES_FILE,
                     new TypeReference<>() {
                     });
             if (rawData.isEmpty()) {
                 throw new IllegalStateException(
-                        "No entries found in model prices file '%s'".formatted(CostService.MODEL_PRICES_FILE));
+                        "No entries found in model prices file '%s'".formatted(ModelPriceTable.MODEL_PRICES_FILE));
             }
 
             var capabilities = new HashMap<String, ModelCapability>();
@@ -346,7 +346,7 @@ public class ModelCapabilities {
             return Collections.unmodifiableMap(capabilities);
         } catch (IOException exception) {
             throw new UncheckedIOException(
-                    "Failed to load model capabilities from file '%s'".formatted(CostService.MODEL_PRICES_FILE),
+                    "Failed to load model capabilities from file '%s'".formatted(ModelPriceTable.MODEL_PRICES_FILE),
                     exception);
         }
     }

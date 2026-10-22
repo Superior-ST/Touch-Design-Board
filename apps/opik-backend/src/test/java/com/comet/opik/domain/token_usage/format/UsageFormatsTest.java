@@ -1,7 +1,7 @@
 package com.comet.opik.domain.token_usage.format;
 
 import com.comet.opik.api.ModelCostData;
-import com.comet.opik.domain.cost.CostService;
+import com.comet.opik.domain.cost.ModelPriceTable;
 import com.comet.opik.domain.token_usage.UsageCases;
 import com.comet.opik.domain.token_usage.model.AnthropicNativeUsage;
 import com.comet.opik.domain.token_usage.model.BedrockConverseNativeUsage;
@@ -73,7 +73,7 @@ class UsageFormatsTest {
         @Test
         void everyProviderWithItsOwnFormatIsAProviderOfThePriceFile() throws IOException {
             var priceFileProviders = new HashSet<String>();
-            for (var file : List.of(CostService.MODEL_PRICES_FILE, CostService.MODEL_PRICES_OVERRIDES_FILE)) {
+            for (var file : List.of(ModelPriceTable.MODEL_PRICES_FILE, ModelPriceTable.MODEL_PRICES_OVERRIDES_FILE)) {
                 Map<String, ModelCostData> costsByModel = JsonUtils.readJsonFile(file, new TypeReference<>() {
                 });
                 costsByModel.values().forEach(cost -> priceFileProviders.add(cost.litellmProvider()));

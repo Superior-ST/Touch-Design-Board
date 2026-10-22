@@ -35,7 +35,7 @@ class ProviderRegistryTest {
 
     private static Set<String> priceFileProviders() {
         var providers = new TreeSet<String>();
-        for (var file : List.of(CostService.MODEL_PRICES_FILE, CostService.MODEL_PRICES_OVERRIDES_FILE)) {
+        for (var file : List.of(ModelPriceTable.MODEL_PRICES_FILE, ModelPriceTable.MODEL_PRICES_OVERRIDES_FILE)) {
             try {
                 Map<String, ModelCostData> costsByModel = JsonUtils.readJsonFile(file, new TypeReference<>() {
                 });
@@ -95,6 +95,32 @@ class ProviderRegistryTest {
             "my-gateway, my-gateway"})
     void resolveTrimsAndLowercasesTheProvider(String provider, String expected) {
         assertThat(ProviderRegistry.resolve(provider, null)).contains(expected);
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "api.cerebras.ai, cerebras",
+            "API.Cerebras.AI, cerebras",
+            "cerebras.ai, cerebras",
+            "api.cerebras.ai., cerebras",
+            "api.deepseek.com, deepseek",
+            "api.x.ai, xai",
+            "api.z.ai, zai",
+            "api.fireworks.ai, fireworks_ai",
+            "api.groq.com, groq",
+            "api.openai.com, openai",
+            "openrouter.ai, openrouter",
+            "api.together.xyz, together_ai",
+            "api.together.xyz:443, together_ai"})
+    void resolveMapsAnApiHostToTheProviderItNames(String host, String expected) {
+        assertThat(ProviderRegistry.resolve(host, null)).contains(expected);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"api.example.com", "inference.cerebras.ai", "api.eu.cerebras.ai", "openai.internal",
+            "api.deepseek.local", "deepseek.vercel.app", "localhost:8080", "127.0.0.1:8000"})
+    void resolveKeepsAHostThatNamesNoProviderAsSent(String host) {
+        assertThat(ProviderRegistry.resolve(host, null)).contains(host);
     }
 
     @Test
