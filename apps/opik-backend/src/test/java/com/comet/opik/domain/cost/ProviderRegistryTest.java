@@ -35,7 +35,7 @@ class ProviderRegistryTest {
 
     private static Set<String> priceFileProviders() {
         var providers = new TreeSet<String>();
-        for (var file : List.of(CostService.MODEL_PRICES_FILE, CostService.MODEL_PRICES_OVERRIDES_FILE)) {
+        for (var file : List.of(ModelPriceTable.MODEL_PRICES_FILE, ModelPriceTable.MODEL_PRICES_OVERRIDES_FILE)) {
             try {
                 Map<String, ModelCostData> costsByModel = JsonUtils.readJsonFile(file, new TypeReference<>() {
                 });

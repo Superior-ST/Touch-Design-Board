@@ -1425,7 +1425,7 @@ class CostServiceTest {
     }
 
     private static Stream<Arguments> provideTokenPricedProviders() throws IOException {
-        Map<String, ModelCostData> prices = JsonUtils.readJsonFile(CostService.MODEL_PRICES_FILE,
+        Map<String, ModelCostData> prices = JsonUtils.readJsonFile(ModelPriceTable.MODEL_PRICES_FILE,
                 new TypeReference<>() {
                 });
         Map<String, Map<String, ModelCostData>> rowsByModelByProvider = prices.entrySet().stream()
