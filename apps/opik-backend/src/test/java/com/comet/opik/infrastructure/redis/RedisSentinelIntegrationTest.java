@@ -48,7 +48,9 @@ class RedisSentinelIntegrationTest {
     private final RedisContainerUtils.StartedSentinel sentinel = RedisContainerUtils
             .startSentinel("master-" + RandomStringUtils.secure().nextAlphanumeric(8));
     private final RedisContainerUtils.SentinelTopology topology = sentinel.topology();
-    private final MySQLContainer mysql = MySQLContainerUtils.newMySQLContainer();
+    // Not reused: the rate-limit test leaves a project in the default workspace, which other tests expect to hold
+    // only its default project, and the limit of one call blocks deleting it.
+    private final MySQLContainer mysql = MySQLContainerUtils.newMySQLContainer(false);
     private final GenericContainer<?> zookeeper = ClickHouseContainerUtils.newZookeeperContainer();
     private final ClickHouseContainer clickHouse = ClickHouseContainerUtils.newClickHouseContainer(zookeeper);
 

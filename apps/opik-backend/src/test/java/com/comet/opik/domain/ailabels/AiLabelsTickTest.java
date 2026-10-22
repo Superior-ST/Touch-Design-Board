@@ -39,6 +39,7 @@ import org.quartz.JobKey;
 import org.quartz.SchedulerException;
 import org.quartz.SimpleTrigger;
 import org.quartz.impl.matchers.GroupMatcher;
+import org.redisson.api.RedissonReactiveClient;
 import org.testcontainers.clickhouse.ClickHouseContainer;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.Network;
@@ -58,6 +59,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -69,6 +71,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -146,11 +149,11 @@ class AiLabelsTickTest {
             """ + IntStream.range(0, WIDE_QUESTIONS)
             .mapToObj(i -> "  q%02d: {type: noul, instructions: \"Check %d?\"}\n".formatted(i, i))
             .collect(Collectors.joining());
-    // The sweep cadence is 1 s, counted from the previous tick's end, by which its sweep lock was taken. The extra half
-    // second covers clock drift between the lock and the test.
-    private static final Duration TICK_GAP = Duration.ofMillis(1_500);
-    // Wide enough that the tick asserting "not yet retried" lands inside D even on a slow runner.
-    private static final Duration RETRY_DELAY = Duration.ofSeconds(8);
+    // A tick sweeps only once its sweep lock has expired: dropping the lock before each tick stands in for the sweep
+    // interval, so the tests never wait it out.
+    private static final String SWEEP_LOCK_KEY = "ai_labels:sweep";
+    // The tick asserting "not yet retried" follows the failure within a second; wide enough for a slow runner.
+    private static final Duration RETRY_DELAY = Duration.ofSeconds(4);
     // ClickHouse stamps updated_at with its own clock, which can drift from ours.
     private static final Duration CLOCK_MARGIN = Duration.ofSeconds(1);
 
@@ -203,6 +206,7 @@ class AiLabelsTickTest {
     private OpikConfiguration opikConfig;
     private TransactionTemplate template;
     private LockService lockService;
+    private RedissonReactiveClient redisClient;
     private GuiceJobManager jobManager;
     private AiLabelsTickService tickService;
     private InferenceClient client;
@@ -216,7 +220,6 @@ class AiLabelsTickTest {
     private Connection clickHouseConnection;
 
     private Instant lastTick = Instant.EPOCH;
-    private Instant lastTickEnd = Instant.EPOCH;
     private long defaultBudget;
     private int defaultChunkTraces;
     private long defaultRenderBudgetBytes;
@@ -231,13 +234,14 @@ class AiLabelsTickTest {
 
     @BeforeAll
     void beforeAll(OpikConfiguration opikConfig, TransactionTemplate template, @Jit LockService lockService,
-            GuiceJobManager jobManager, @Jit AiLabelsTickService tickService, @Jit InferenceClient client,
-            @Jit AiLabelSweepService sweepService, @Jit AiLabelTaskRegistry registry, @Jit AiLabelRenderer renderer,
-            @Jit AiLabelItemBuilder itemBuilder, @Jit AiLabelResultMapper resultMapper,
+            RedissonReactiveClient redisClient, GuiceJobManager jobManager, @Jit AiLabelsTickService tickService,
+            @Jit InferenceClient client, @Jit AiLabelSweepService sweepService, @Jit AiLabelTaskRegistry registry,
+            @Jit AiLabelRenderer renderer, @Jit AiLabelItemBuilder itemBuilder, @Jit AiLabelResultMapper resultMapper,
             @Jit AiLabelStatusDAO statusDAO, @Jit AiLabelsDAO labelsDAO) throws SQLException {
         this.opikConfig = opikConfig;
         this.template = template;
         this.lockService = lockService;
+        this.redisClient = redisClient;
         this.jobManager = jobManager;
         this.tickService = tickService;
         this.client = client;
@@ -262,7 +266,6 @@ class AiLabelsTickTest {
         lockService.bestEffortLock(new LockService.Lock("ai_labels:leader"), Mono.just(true), Mono.empty(),
                 Duration.ofSeconds(5), Duration.ofSeconds(60)).block();
         lastTick = Instant.now();
-        lastTickEnd = lastTick;
     }
 
     @AfterAll
@@ -571,13 +574,18 @@ class AiLabelsTickTest {
         var other = enabledWorkspace();
         var throttledTrace = trace(throttled, UUID.randomUUID(), 0);
         var otherTrace = trace(other, UUID.randomUUID(), 0);
-        // Wide enough that the second tick can't cross it on a slow runner.
         var retryAfter = Duration.ofSeconds(8);
         var stubs = List.of(stubQuotaExceeded(DECIDE_PATH, throttled, retryAfter),
                 stubQuotaExceeded(GENERATE_PATH, throttled, retryAfter));
+        // The backoff is measured on the service's clock, held still here so the ticks can't drift past it.
+        var now = new AtomicReference<>(Instant.now());
+        var clock = mock(Clock.class);
+        when(clock.instant()).thenAnswer(invocation -> now.get());
+        var service = new AiLabelsTickService(config(), template, client, lockService, sweepService, registry,
+                renderer, itemBuilder, resultMapper, statusDAO, labelsDAO, clock);
 
-        tick();
-        var throttledAt = Instant.now();
+        tick(service);
+        var throttledAt = now.get();
 
         // The submit isn't retried, and the workspace's other job isn't tried.
         assertThat(submits(DECIDE_PATH, throttled)).hasSize(1);
@@ -585,14 +593,15 @@ class AiLabelsTickTest {
         assertThat(inFlight(throttled)).isEmpty();
         assertThat(inFlight(other)).extracting(AiLabelJobItem::traceId).containsOnly(otherTrace).hasSize(2);
 
-        tick();
+        now.set(throttledAt.plus(retryAfter).minusMillis(1));
+        tick(service);
 
         assertThat(submits(DECIDE_PATH, throttled)).hasSize(1);
         assertThat(inFlight(throttled)).isEmpty();
 
         stubs.forEach(wireMock.server()::removeStub);
-        pauseUntil(throttledAt.plus(retryAfter));
-        tick();
+        now.set(throttledAt.plus(retryAfter));
+        tick(service);
 
         assertThat(submits(DECIDE_PATH, throttled)).hasSize(2);
         assertThat(submits(GENERATE_PATH, throttled)).hasSize(1);
@@ -862,7 +871,7 @@ class AiLabelsTickTest {
                 }));
             }).when(slowRenderer).render(anyString(), anyList(), anyCollection());
             var service = new AiLabelsTickService(config(), template, client, lockService, sweepService, registry,
-                    slowRenderer, itemBuilder, resultMapper, statusDAO, labelsDAO);
+                    slowRenderer, itemBuilder, resultMapper, statusDAO, labelsDAO, Clock.systemUTC());
 
             tick(service);
             var took = Duration.between(lastTick, Instant.now());
@@ -1113,7 +1122,7 @@ class AiLabelsTickTest {
     private AiLabelsTickService tickService(TransactionTemplate template, AiLabelStatusDAO statusDAO,
             AiLabelTaskRegistry registry, AiLabelSweepService sweepService) {
         return new AiLabelsTickService(config(), template, client, lockService, sweepService, registry, renderer,
-                itemBuilder, resultMapper, statusDAO, labelsDAO);
+                itemBuilder, resultMapper, statusDAO, labelsDAO, Clock.systemUTC());
     }
 
     private static AiLabelSweepDAO countingSweeps(AiLabelSweepDAO sweepDAO, AtomicInteger sweeps) {
@@ -1130,14 +1139,10 @@ class AiLabelsTickTest {
     }
 
     private void tick(AiLabelsTickService service) {
-        pauseUntil(lastTickEnd.plus(TICK_GAP));
+        redisClient.getPermitExpirableSemaphore(SWEEP_LOCK_KEY).delete().block();
         stubStatus();
         lastTick = Instant.now();
-        try {
-            service.tick(lastTick);
-        } finally {
-            lastTickEnd = Instant.now();
-        }
+        service.tick(lastTick);
     }
 
     private static void pauseUntil(Instant instant) {
